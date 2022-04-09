@@ -27,8 +27,8 @@ log = logging.getLogger(__name__)
 
 SPLITS = [
     "train-clean-100",
-    "train-clean-360",
-    "train-other-500",
+    # "train-clean-360",
+    # "train-other-500",
     "dev-clean",
     "dev-other",
     "test-clean",

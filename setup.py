@@ -93,82 +93,82 @@ extensions = [
 cmdclass = {}
 
 
-try:
-    # torch is not available when generating docs
-    from torch.utils import cpp_extension
+# try:
+#     # torch is not available when generating docs
+#     from torch.utils import cpp_extension
 
-    extensions.extend(
-        [
-            cpp_extension.CppExtension(
-                "fairseq.libbase",
-                sources=[
-                    "fairseq/clib/libbase/balanced_assignment.cpp",
-                ],
-            )
-        ]
-    )
+#     extensions.extend(
+#         [
+#             cpp_extension.CppExtension(
+#                 "fairseq.libbase",
+#                 sources=[
+#                     "fairseq/clib/libbase/balanced_assignment.cpp",
+#                 ],
+#             )
+#         ]
+#     )
 
-    extensions.extend(
-        [
-            cpp_extension.CppExtension(
-                "fairseq.libnat",
-                sources=[
-                    "fairseq/clib/libnat/edit_dist.cpp",
-                ],
-            ),
-            cpp_extension.CppExtension(
-                "alignment_train_cpu_binding",
-                sources=[
-                    "examples/operators/alignment_train_cpu.cpp",
-                ],
-            ),
-        ]
-    )
-    if "CUDA_HOME" in os.environ:
-        extensions.extend(
-            [
-                cpp_extension.CppExtension(
-                    "fairseq.libnat_cuda",
-                    sources=[
-                        "fairseq/clib/libnat_cuda/edit_dist.cu",
-                        "fairseq/clib/libnat_cuda/binding.cpp",
-                    ],
-                ),
-                cpp_extension.CppExtension(
-                    "fairseq.ngram_repeat_block_cuda",
-                    sources=[
-                        "fairseq/clib/cuda/ngram_repeat_block_cuda.cpp",
-                        "fairseq/clib/cuda/ngram_repeat_block_cuda_kernel.cu",
-                    ],
-                ),
-                cpp_extension.CppExtension(
-                    "alignment_train_cuda_binding",
-                    sources=[
-                        "examples/operators/alignment_train_kernel.cu",
-                        "examples/operators/alignment_train_cuda.cpp",
-                    ],
-                ),
-            ]
-        )
-    cmdclass["build_ext"] = cpp_extension.BuildExtension
+#     extensions.extend(
+#         [
+#             cpp_extension.CppExtension(
+#                 "fairseq.libnat",
+#                 sources=[
+#                     "fairseq/clib/libnat/edit_dist.cpp",
+#                 ],
+#             ),
+#             cpp_extension.CppExtension(
+#                 "alignment_train_cpu_binding",
+#                 sources=[
+#                     "examples/operators/alignment_train_cpu.cpp",
+#                 ],
+#             ),
+#         ]
+#     )
+#     if "CUDA_HOME" in os.environ:
+#         extensions.extend(
+#             [
+#                 cpp_extension.CppExtension(
+#                     "fairseq.libnat_cuda",
+#                     sources=[
+#                         "fairseq/clib/libnat_cuda/edit_dist.cu",
+#                         "fairseq/clib/libnat_cuda/binding.cpp",
+#                     ],
+#                 ),
+#                 cpp_extension.CppExtension(
+#                     "fairseq.ngram_repeat_block_cuda",
+#                     sources=[
+#                         "fairseq/clib/cuda/ngram_repeat_block_cuda.cpp",
+#                         "fairseq/clib/cuda/ngram_repeat_block_cuda_kernel.cu",
+#                     ],
+#                 ),
+#                 cpp_extension.CppExtension(
+#                     "alignment_train_cuda_binding",
+#                     sources=[
+#                         "examples/operators/alignment_train_kernel.cu",
+#                         "examples/operators/alignment_train_cuda.cpp",
+#                     ],
+#                 ),
+#             ]
+#         )
+#     cmdclass["build_ext"] = cpp_extension.BuildExtension
 
-except ImportError:
-    pass
+# except ImportError:
+#     pass
 
 
-if "READTHEDOCS" in os.environ:
-    # don't build extensions when generating docs
-    extensions = []
-    if "build_ext" in cmdclass:
-        del cmdclass["build_ext"]
+# if "READTHEDOCS" in os.environ:
+#     # don't build extensions when generating docs
+#     extensions = []
+#     if "build_ext" in cmdclass:
+#         del cmdclass["build_ext"]
 
-    # use CPU build of PyTorch
-    dependency_links = [
-        "https://download.pytorch.org/whl/cpu/torch-1.7.0%2Bcpu-cp36-cp36m-linux_x86_64.whl"
-    ]
-else:
-    dependency_links = []
-
+#     # use CPU build of PyTorch
+#     dependency_links = [
+#         "https://download.pytorch.org/whl/cpu/torch-1.7.0%2Bcpu-cp36-cp36m-linux_x86_64.whl"
+#     ]
+# else:
+#     dependency_links = []
+dependency_links = []
 
 if "clean" in sys.argv[1:]:
     # Source: https://bit.ly/2NLVsgE
@@ -218,10 +218,10 @@ def do_setup(package_data):
             'numpy; python_version>="3.7"',
             "regex",
             "sacrebleu>=1.4.12",
-            "torch",
+            # "torch",
             "tqdm",
             "bitarray",
-            "torchaudio>=0.8.0",
+            # "torchaudio>=0.8.0",
         ],
         dependency_links=dependency_links,
         packages=find_packages(
