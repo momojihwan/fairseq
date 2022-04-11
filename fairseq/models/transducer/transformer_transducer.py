@@ -11,7 +11,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from fairseq import checkpoint_utils, utils
-from fairseq.data.data_utils import lengths_to_padding_mask, subsequent_mask
+from fairseq.data.data_utils import lengths_to_padding_mask, pad_list, subsequent_mask
 from fairseq.models import (
     FairseqEncoder,
     BaseFairseqModel,
@@ -316,6 +316,7 @@ class LTTTransformerEncoder(FairseqEncoder):
         if args.no_scale_embedding:
             self.embed_scale = 1.0
         self.padding_idx = 1
+        self.blank_idx = 0
 
         self.embed_tokens = embeded_tokens
 
@@ -398,6 +399,12 @@ class LTTTransformerEncoder(FairseqEncoder):
 
 
     def _forward(self, src_tokens, src_lengths, return_all_hiddens=False):
+        blank = src_tokens.new([self.blank_idx])
+        src = [y[y != self.padding_idx] for y in src_tokens]
+        src = [torch.cat([blank, y], dim=0) for y in src]
+        src_tokens = pad_list(src, self.padding_idx)
+        src_lengths = src_lengths + 1
+
         x = self.embed_scale * self.embed_tokens(src_tokens)
 
         encoder_padding_mask = lengths_to_padding_mask(src_lengths)[:, None, :].to(src_tokens.device) # (B, 1, L)

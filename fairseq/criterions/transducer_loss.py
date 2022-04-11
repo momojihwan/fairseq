@@ -4,6 +4,7 @@
 # LICENSE file in the root directory of this source tree.
 
 import math
+from re import U
 import numpy as np
 from dataclasses import dataclass
 from logging import logProcesses
@@ -19,6 +20,7 @@ from typing import Tuple
 from typing import Union
 
 from fairseq import metrics, utils
+from fairseq.data.data_utils import pad_list
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.dataclass import FairseqDataclass
 from omegaconf import II
@@ -77,7 +79,9 @@ class Transducer(FairseqCriterion):
         """
         
         net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
-        loss, _ = self.compute_loss(model, net_output, sample, reduce=reduce)
+
+        target = self.get_transducer_tasks_io(sample['target'])
+        loss, _ = self.compute_loss(model, net_output, sample, target, reduce=reduce)
         # pred = self.greedy_search(model, net_output)
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
@@ -88,9 +92,9 @@ class Transducer(FairseqCriterion):
             "nsentences": sample["target"].size(0),
             "sample_size": sample_size,
         }
-        n_correct, total = self.compute_accuracy(model, net_output, sample)
-        logging_output["n_correct"] = utils.item(n_correct.data)
-        logging_output["total"] = utils.item(total.data)
+        # n_correct, total = self.compute_accuracy(model, net_output, sample)
+        # logging_output["n_correct"] = utils.item(n_correct.data)
+        # logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
 
     def greedy_search(self, model, net_output):
@@ -127,7 +131,8 @@ class Transducer(FairseqCriterion):
                 dec_out = model.decoder.score(dec_input)
             
             outputs.append(torch.LongTensor(pred_tokens))
-        # print("outputs : ", outputs)
+        print("outputs : ", outputs)
+        exit()
         return torch.stack(outputs, dim=0)
 
     def beam_search(self, x, T, W):
@@ -180,12 +185,13 @@ class Transducer(FairseqCriterion):
 
         return [(B[0].k)[1:]]
 
-    def compute_loss(self, model, net_output, sample, reduce=True):
+    def compute_loss(self, model, net_output, sample, target,reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
-        target = model.get_targets(sample, net_output)
-        target = target [:, :-1]
+
+        # target = model.get_targets(sample, net_output)
+        # target = target [:, :-1]
         frames_lengths = net_output[0]["input_lengths"]
-        labels_lengths = sample["target_lengths"] - 1 # target label length is U - 1
+        labels_lengths = sample["target_lengths"]  # target label length is U - 1
 
         loss = rnnt_loss(
             lprobs.float(), 
@@ -200,10 +206,26 @@ class Transducer(FairseqCriterion):
     
     def get_transducer_tasks_io(
         self,
-        labels: torch.Tensor,
-        enc_out_len: torch.Tensor,
+        labels: torch.Tensor,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
     ):
-    
+        """Get Transducer tasks inputs and outputs
+
+        Args:
+            labels: Label ID sequences. (B, U)
+            enc_out_len: Time Lengths. (B)
+        
+        Returns:
+            target: Targer label ID sequences. (B, L)
+            T_lengths: Time lengths. (B)
+            U_lengths: Label legths. (B)
+        """
+
+        device = labels.device
+        labels_unpad = [label[label != self.padding_idx] for label in labels]
+        target = pad_list(labels_unpad, self.blank_id).type(torch.int32).to(device)
+
+        return target
+
 
     @torch.no_grad()
     def compute_accuracy(self, model, net_output, sample):
