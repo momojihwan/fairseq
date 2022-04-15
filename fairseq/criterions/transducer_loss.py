@@ -67,7 +67,7 @@ class Transducer(FairseqCriterion):
         self.sentence_avg = sentence_avg
         self.padding_idx = task.tgt_dict.pad() 
         self.bos_idx = task.tgt_dict.bos()
-        self.blank_id = 0
+        self.blank_idx = 0
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -77,11 +77,11 @@ class Transducer(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
-        
-        net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
 
-        target = self.get_transducer_tasks_io(sample['target'])
-        loss, _ = self.compute_loss(model, net_output, sample, target, reduce=reduce)
+        # sample["target"] = self.get_transducer_tasks_io(sample['target'])
+        net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
+        
+        loss, _ = self.compute_loss(model, net_output, sample, reduce=reduce)
         # pred = self.greedy_search(model, net_output)
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
@@ -92,7 +92,7 @@ class Transducer(FairseqCriterion):
             "nsentences": sample["target"].size(0),
             "sample_size": sample_size,
         }
-        # n_correct, total = self.compute_accuracy(model, net_output, sample)
+        # n_correct, total = self.compute_accuracy(model, net_output, target, sample)
         # logging_output["n_correct"] = utils.item(n_correct.data)
         # logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
@@ -111,9 +111,9 @@ class Transducer(FairseqCriterion):
 
         for enc_out in enc_outputs:
             pred_tokens = list()
-            dec_input = enc_out.new_zeros(1, 1).fill_(self.bos_idx).long()
+            dec_input = enc_out.new_zeros(1, 1).fill_(self.blank_idx).long()
             dec_out = model.decoder.score(dec_input)
-            
+
             # enc : (L, D)
             # dec : (B, L, D)
             for t in range(enc_outputs.size(1)):
@@ -125,7 +125,8 @@ class Transducer(FairseqCriterion):
                 if pred_token != 1:
                     pred_tokens.append(pred_token)
 
-                dec_input = torch.LongTensor([[pred_token]])
+                dec_input = torch.LongTensor([pred_token])
+
                 if torch.cuda.is_available():
                     dec_input = dec_input.cuda()
                 dec_out = model.decoder.score(dec_input)
@@ -185,21 +186,21 @@ class Transducer(FairseqCriterion):
 
         return [(B[0].k)[1:]]
 
-    def compute_loss(self, model, net_output, sample, target,reduce=True):
+    def compute_loss(self, model, net_output, sample, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
 
         # target = model.get_targets(sample, net_output)
         # target = target [:, :-1]
-        frames_lengths = net_output[0]["input_lengths"]
+        frames_lengths = sample["net_input"]["src_lengths"]
         labels_lengths = sample["target_lengths"]  # target label length is U - 1
 
         loss = rnnt_loss(
             lprobs.float(), 
-            target.int(), 
+            sample["net_input"]["prev_output_tokens"].int(), 
             frames_lengths=frames_lengths.int(), 
             labels_lengths=labels_lengths.int(),
-            reduction="sum",
-            blank=self.blank_id
+            reduction="mean",
+            blank=self.blank_idx
         )
 
         return loss, loss
@@ -222,15 +223,15 @@ class Transducer(FairseqCriterion):
 
         device = labels.device
         labels_unpad = [label[label != self.padding_idx] for label in labels]
-        target = pad_list(labels_unpad, self.blank_id).type(torch.int32).to(device)
+        target = pad_list(labels_unpad, self.blank_idx).type(torch.int32).to(device)
 
         return target
 
 
     @torch.no_grad()
-    def compute_accuracy(self, model, net_output, sample):
+    def compute_accuracy(self, model, net_output, target, sample):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
-        target = model.get_targets(sample, net_output)
+        # target = model.get_targets(sample, net_output)
         mask = target.ne(self.padding_idx) # B, U
 
         bsz, tsz, usz, dsz = lprobs.size()
