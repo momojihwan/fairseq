@@ -3,13 +3,15 @@
 from email.encoders import encode_7or8bit
 import logging
 import math
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 from pathlib import Path
+from unicodedata import bidirectional
 from fairseq.data.dictionary import Dictionary
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
 from fairseq import checkpoint_utils, utils
 from fairseq.data.data_utils import lengths_to_padding_mask, pad_list, subsequent_mask
 from fairseq.models import (
@@ -33,7 +35,7 @@ logger = logging.getLogger(__name__)
 class JointNetwork(nn.Module):
     def __init__(self, joint_dim, num_outputs):
         super(JointNetwork, self).__init__()
-        self.linear = nn.Linear(joint_dim, num_outputs)
+        self.linear = nn.Linear(joint_dim * 2, num_outputs)
         self.tanh = nn.Tanh()
 
     def forward(self, enc_out, pred_out):
@@ -97,12 +99,13 @@ class Conv1dSubsampler(nn.Module):
 
 @register_model("rnn_transducer")
 class TransformerTransducerModel(BaseFairseqModel):
-    def __init__(self, args, encoder, decoder, joint):
+    def __init__(self, args, encoder, encoder_proj, decoder, decoder_proj, joint):
         super().__init__()
 
         self.encoder = encoder
         self.decoder = decoder
-
+        self.encoder_proj = encoder_proj
+        self.decoder_proj = decoder_proj
         self.joint = joint
 
     @staticmethod
@@ -268,11 +271,11 @@ class TransformerTransducerModel(BaseFairseqModel):
         )
         encoder = cls.build_encoder(args)
         decoder = cls.build_decoder(args, task, decoder_embed_tokens)
-        # encoder_proj = nn.Linear(args.encoder_embed_dim, args.encoder_embed_dim)
-        # decoder_proj = nn.Linear(args.decoder_embed_dim, args.decoder_embed_dim)
-        joint = JointNetwork(args.encoder_embed_dim, len(task.target_dictionary))
+        encoder_proj = nn.Linear(args.encoder_embed_dim, args.joint_dim)
+        decoder_proj = nn.Linear(args.decoder_embed_dim, args.joint_dim)
+        joint = JointNetwork(args.joint_dim, len(task.target_dictionary))
 
-        return cls(args, encoder, decoder, joint)
+        return cls(args, encoder, encoder_proj, decoder, decoder_proj, joint)
 
     def get_normalized_probs(
         self,
@@ -282,10 +285,9 @@ class TransformerTransducerModel(BaseFairseqModel):
     ):
         # net_output['encoder_out'] is a (T, B, D) tensor
         encoder_output, decoder_output = net_output
-        encoder_output = encoder_output["encoder_out"][0]
-        
-        # encoder_output = self.encoder_proj(encoder_output)
-        # decoder_output = self.decoder_proj(decoder_output)
+        encoder_output = encoder_output["encoder_out"]
+        encoder_output = self.encoder_proj(encoder_output)
+        decoder_output = self.decoder_proj(decoder_output)
 
         logits = self.joint(
             encoder_output,
@@ -296,29 +298,57 @@ class TransformerTransducerModel(BaseFairseqModel):
         return logits
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens, prev_output_tokens_length):
-        encoder_out = self.encoder(src_tokens=src_tokens, src_lengths=src_lengths)
-        decoder_out = self.decoder(src_tokens=prev_output_tokens, src_lengths=prev_output_tokens_length)
+        encoder_out = self.encoder(src_tokens, src_lengths)
+        decoder_out = self.decoder(prev_output_tokens)
         return encoder_out, decoder_out 
 
 class LTTRNNEncoder(FairseqEncoder):
     def __init__(self, args, dictionary, embeded_tokens):
         super().__init__(None)
 
+        self.padding_idx = 1
+        self.blank_idx = 0
+
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
 
-        self.embed = nn.Embedding(len(dictionary), args.decoder_embed_dim)
+        self.embed = nn.Embedding(len(dictionary), args.decoder_embed_dim, padding_idx=self.blank_idx)
+        self.dropout = nn.Dropout(p=args.dropout)
 
-        self.rnn = nn.GRUCell(
-            input_size=args.decoder_embed_dim,
-            hidden_size=args.encoder_embed_dim,
+        rnn_layer = nn.LSTM if args.rnn_type == "lstm" else nn.GRU
+
+        self.rnn = nn.ModuleList(
+            [rnn_layer(args.decoder_embed_dim, args.decoder_embed_dim, 1, batch_first=True)]
+        )
+
+        for _ in range(1, args.decoder_layers):
+            self.rnn += [rnn_layer(args.decoder_embed_dim, args.decoder_embed_dim, 1, batch_first=True)]
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = args.rnn_type
+        self.dlayers = args.decoder_layers
+        self.dunits = args.decoder_embed_dim
+        self.joint_dim = args.joint_dim
+
+    def init_state(self, batch_size):
+        h_n = torch.zeros(
+            self.dlayers,
+            batch_size,
+            self.dunits,
+            device=self.device,
+        )
+
+        if self.dtype == "lstm":
+            c_n = torch.zeros(
+                self.dlayers,
+                batch_size,
+                self.dunits,
+                device=self.device,
             )
-        
-        self.linear = nn.Linear(args.decoder_embed_dim, args.joint_dim)
 
-        self.init_state = nn.Parameter(torch.randn(args.decoder_embed_dim))
-        self.padding_idx = 1
-        self.blank_idx = 0
+            return (h_n, c_n)
+
+        return (h_n, None)
 
     def score(self, dec_input, cache={}):
         """One-step forward hypothesis.
@@ -332,44 +362,52 @@ class LTTRNNEncoder(FairseqEncoder):
         """
 
 
-    def _forward(self, src_tokens, prev_state, return_all_hiddens=False):
+    def _forward(self, sequence, prev_state):
         """"
         Args:
-            src_tokens : (B, L)
+            sequence : (B, L)
             prev_state : (B, D)
-        """
-
-        embedding = self.embed(src_tokens)
-
-        decoder_state = self.rnn.forward(embedding, prev_state)
-        dec_out = self.linear(decoder_state)
-
-        return dec_out, decoder_state
-
-    def forward(self, src_tokens, src_lengths, return_all_hiddens=False):
         
-        state = torch.stack([self.init_state] * src_tokens.size(0)).to(src_tokens.device)
-        outs = []
-        U = src_tokens.shape[1]
+        Returns:
+            sequence: RNN output sequences. (B, D)
+            (h_next, c_next): Decoder hidden states. (N, B, D), (N, B, D)
 
-        for u in range(U+1):
-            if u == 0:
-                dec_input = torch.tensor([self.blank_idx] * src_tokens.size(0)).to(src_tokens.device)
-            else:
-                dec_input = src_tokens[:,u-1]
+        """
+        
+        h_prev, c_prev = prev_state
+        h_next, c_next = self.init_state(sequence.size(0))
 
-            if self.num_updates < self.encoder_freezing_updates:
-                with torch.no_grad():
-                    x, state = self._forward(
-                        dec_input, state, return_all_hiddens=return_all_hiddens
-                    )
-            else:
-                x, state = self._forward(
-                    dec_input, state, return_all_hiddens=return_all_hiddens
+        for layer in range(self.dlayers):
+            if self.dtype == "lstm":
+                sequence, (
+                    h_next[layer : layer + 1],
+                    c_next[layer : layer + 1],
+                ) = self.rnn[layer](
+                    sequence, hx=(h_prev[layer : layer + 1], c_prev[layer : layer + 1])
                 )
-            outs.append(x)
-        out = torch.stack(outs, dim=1)
-        return out
+            else:
+                sequence, h_next[layer : layer + 1] = self.rnn[layer](
+                    sequence, hx=h_prev[layer : layer + 1]
+                )
+            
+        return sequence, (h_next, c_next)
+
+
+    def forward(self, labels):
+        '''
+        Args:
+            labels: Label ID sequences. (B, L)
+
+        Returns:
+            dec_out: Decoder output sequences. (B, L, D)
+        '''
+
+        init_state = self.init_state(labels.size(0))
+        dec_embed = self.embed(labels)
+        
+        dec_out, _ = self._forward(dec_embed, init_state)
+
+        return dec_out
 
     def reorder_encoder_out(self, encoder_out, new_order):
         new_encoder_out = (
@@ -421,57 +459,105 @@ class S2TRNNEncoder(FairseqEncoder):
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
 
-        self.rnn = nn.GRU(
-            input_size=args.input_feat,
-            hidden_size=args.encoder_embed_dim,
-            num_layers=args.encoder_layers,
-            batch_first=True,
-            bidirectional=args.bidirectional,
-            dropout=args.dropout)
+        for i in range(args.encoder_layers):
+            if i == 0:
+                input_dim = args.input_feat
+            else:
+                input_dim = args.encoder_embed_dim
+            
+            rnn_layer = nn.LSTM if "lstm" in args.rnn_type else nn.GRU
+            rnn = rnn_layer(
+                input_dim, args.encoder_embed_dim, num_layers=1, bidirectional=args.bidirectional, batch_first=True
+            )
+            
+            setattr(self, "%s%d" % ("birnn" if args.bidirectional else "rnn", i), rnn)
+
+        self.dropout = nn.Dropout(p=args.dropout)
         
-        if args.bidirectional is True:
-            self.linear = nn.Linear(args.encoder_embed_dim * 2, args.joint_dim)
-        else:
-            self.linear = nn.Linear(args.encoder_embed_dim, args.joint_dim)
+        self.elayers = args.encoder_layers
+        self.embed_dim = args.encoder_embed_dim
+        self.joint_dim = args.joint_dim
+        self.rnn_type = args.rnn_type
+        self.bidir = args.bidirectional
+        self.linear = nn.Linear(self.embed_dim, self.joint_dim)
 
         self.padding_idx = 1
 
-    def _forward(self, src_tokens, src_lengths, return_all_hiddens=False):
+    def _forward(
+        self, 
+        src_tokens: torch.Tensor, 
+        src_lengths: torch.Tensor, 
+        prev_states: Optional[List[torch.Tensor]] = None):
         '''
-        
         Args:
-            src_tokens : (B, L, D)
-            src_lengths :
+            src_tokens : RNN input sequences. (B, L, D)
+            src_lengths : RNN input sequences lengths. (B,)
+            prev_states : RNN hidden states. [N x (B, L, D)]
+
         Returns:
+            enc_out : RNN output sequences. (B, L, D)
+            enc_out_lengths : RNN output sequences lengths. (B,)
+            current_States : RNN hidden states. [N x (B, L, D)]
 
         '''
-        self.rnn.flatten_parameters()
+        current_states = []
+        
+        for layer in range(self.elayers):
+            if not isinstance(src_lengths, torch.Tensor):
+                src_lengths = torch.tensor(src_lengths)
+            
+            pack_enc_input = pack_padded_sequence(
+                src_tokens, src_lengths.cpu(), batch_first=True
+            )
 
-        enc_out = self.rnn(src_tokens)[0]
-        enc_out = self.linear(enc_out)
+            rnn = getattr(self, ("birnn" if self.bidir else "rnn") + str(layer))
 
-        encoder_states = []
+            if isinstance(rnn, (nn.LSTM, nn.GRU)):
+                rnn.flatten_parameters()
+
+            if prev_states is not None and rnn.bidirectional:
+                prev_states = reset_backward_rnn_state(prev_states)
+
+            pack_enc_output, states = rnn(
+                pack_enc_input, hx=None if prev_states is None else prev_states[layer]
+            )
+            current_states.append(states)
+
+            enc_out, enc_len = pad_packed_sequence(pack_enc_output, batch_first=True)
+
+            if self.bidir:
+                enc_out = (
+                    enc_out[:, :, : self.embed_dim] + enc_out[:, :, self.embed_dim :]
+                )
+
+            if layer < self.elayers - 1:
+                src_tokens = self.dropout(enc_out)
+
+        enc_out = torch.tanh(enc_out)
+        # enc_out = enc_out.view(enc_out.size(0), enc_out.size(1), -1)
 
         return {
-            "encoder_out": [enc_out],  # T x B x C
-            "encoder_embedding": [],  # B x T x C
-            "encoder_states": encoder_states,  # List[T x B x C]
-            "src_tokens": [],
-            "src_lengths": [],
+            "encoder_out": enc_out,  # (B, L, D)
+            "src_lengths": enc_len,
+            "encoder_states": current_states,  # List[T x B x C]
         }
 
-    def forward(self, src_tokens, src_lengths, return_all_hiddens=False):
+    def forward(
+        self,
+        src_tokens: torch.Tensor, 
+        src_lengths: torch.Tensor, 
+        prev_states: Optional[List[torch.Tensor]] = None):
         if self.num_updates < self.encoder_freezing_updates:
             with torch.no_grad():
                 x = self._forward(
-                    src_tokens, src_lengths, return_all_hiddens=return_all_hiddens
+                    src_tokens, src_lengths, prev_states
                 )
         else:
             x = self._forward(
-                src_tokens, src_lengths, return_all_hiddens=return_all_hiddens
+                src_tokens, src_lengths, prev_states
             )
         return x
-
+        
     def reorder_encoder_out(self, encoder_out, new_order):
         new_encoder_out = (
             []
@@ -514,11 +600,28 @@ class S2TRNNEncoder(FairseqEncoder):
         super().set_num_updates(num_updates)
         self.num_updates = num_updates
 
+def reset_backward_rnn_state(
+        states: Union[torch.Tensor, List[Optional[torch.Tensor]]]
+    ):
+        """Set backward BRNN states to zeroes.
+    Args:
+        states: Encoder hidden states.
+    Returns:
+        states: Encoder hidden states with backward set to zero.
+    """
+        if isinstance(states, list):
+            for state in states:
+                state[1::2] = 0.0
+        else:
+            states[1::2] = 0.0
+
+        return states    
 
 @register_model_architecture(model_name="rnn_transducer", arch_name="rnn_transducer")
 def base_architecture(args):
     args.encoder_freezing_updates = getattr(args, "encoder_freezing_updates", 0)
     # RNN
+    args.rnn_type = getattr(args, "rnn_type", "lstm")
     args.input_feat = getattr(args, "input_feat", 80)
     args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
     args.encoder_layers = getattr(args, "encoder_layers", 2)

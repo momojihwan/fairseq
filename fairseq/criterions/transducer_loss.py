@@ -82,7 +82,12 @@ class Transducer(FairseqCriterion):
         net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
         
         loss, _ = self.compute_loss(model, net_output, sample, reduce=reduce)
-        # pred = self.greedy_search(model, net_output)
+        # if not self.training:
+        # pred1 = self.greedy_search(model, net_output)
+        # print("pred1 : ", pred1)
+            # pred2 = self.beam_search(net_output[0], 5)
+            # print("pred2 : ", pred2)
+
         sample_size = (
             sample["target"].size(0) if self.sentence_avg else sample["ntokens"]
         )
@@ -97,44 +102,44 @@ class Transducer(FairseqCriterion):
         # logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
 
-    def greedy_search(self, model, net_output):
-        """Greedy search implementation.
-        Args:
-            enc_out: Encoder output sequence. (T, D_enc)
-        Returns:
-            hyp: 1-best hypotheses.
-        """
-        encoder_output, _ = net_output
-        enc_outputs = model.encoder_proj(encoder_output["encoder_out"][0])
+    # def greedy_search(self, model, net_output):
+    #     """Greedy search implementation.
+    #     Args:
+    #         enc_out: Encoder output sequence. (T, D_enc)
+    #     Returns:
+    #         hyp: 1-best hypotheses.
+    #     """
+    #     encoder_output, _ = net_output
+    #     enc_outputs = model.encoder_proj(encoder_output["encoder_out"][0])
         
-        outputs = list()
+    #     outputs = list()
 
-        for enc_out in enc_outputs:
-            pred_tokens = list()
-            dec_input = enc_out.new_zeros(1, 1).fill_(self.blank_idx).long()
-            dec_out = model.decoder.score(dec_input)
+    #     for enc_out in enc_outputs:
+    #         pred_tokens = list()
+    #         dec_input = 
+    #         dec_state = model.decoder.init_state.unsqueeze(0)
+    #         dec_out, dec_state = model.decoder._forward(dec_input, dec_state)
 
-            # enc : (L, D)
-            # dec : (B, L, D)
-            for t in range(enc_outputs.size(1)):
+    #         # enc : (L, D)
+    #         # dec : (B, L, D)
+    #         for t in range(enc_outputs.size(1)):
 
-                logits = model.joint(enc_out[t].view(-1), dec_out.view(-1))
+    #             logits = model.joint(enc_out[t].view(-1), dec_out.view(-1))
 
-                pred_token = logits.argmax(dim=0)
-                pred_token = int(pred_token.item())
-                if pred_token != 1:
-                    pred_tokens.append(pred_token)
+    #             pred_token = logits.argmax(dim=0)
+    #             pred_token = int(pred_token.item())
+    #             if pred_token != 1:
+    #                 pred_tokens.append(pred_token)
 
-                dec_input = torch.LongTensor([pred_token])
+    #             dec_input = torch.LongTensor([pred_token])
 
-                if torch.cuda.is_available():
-                    dec_input = dec_input.cuda()
-                dec_out = model.decoder.score(dec_input)
+    #             if torch.cuda.is_available():
+    #                 dec_input = dec_input.cuda()
+    #             dec_out, dec_state = model.decoder._forward(dec_input, dec_state)
             
-            outputs.append(torch.LongTensor(pred_tokens))
-        print("outputs : ", outputs)
-        exit()
-        return torch.stack(outputs, dim=0)
+    #         outputs.append(torch.LongTensor(pred_tokens))
+
+    #     return torch.stack(outputs, dim=0)
 
     def beam_search(self, x, T, W):
 
@@ -189,14 +194,15 @@ class Transducer(FairseqCriterion):
     def compute_loss(self, model, net_output, sample, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
 
-        # target = model.get_targets(sample, net_output)
-        # target = target [:, :-1]
+        target = model.get_targets(sample, net_output)
+        target = target [:, :-1]
         frames_lengths = sample["net_input"]["src_lengths"]
-        labels_lengths = sample["target_lengths"]  # target label length is U - 1
+        labels_lengths = sample["target_lengths"] - 1  # target label length is U - 1
 
         loss = rnnt_loss(
             lprobs.float(), 
-            sample["net_input"]["prev_output_tokens"].int(), 
+            # sample["net_input"]["prev_output_tokens"].int(), 
+            target.int(),
             frames_lengths=frames_lengths.int(), 
             labels_lengths=labels_lengths.int(),
             reduction="mean",
