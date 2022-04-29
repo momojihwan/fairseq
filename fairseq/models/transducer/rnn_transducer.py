@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 
+from dataclasses import dataclass
 from email.encoders import encode_7or8bit
 import logging
 import math
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
 from unicodedata import bidirectional
 from fairseq.data.dictionary import Dictionary
@@ -32,6 +33,19 @@ from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
+@dataclass
+class Hypothesis:
+    """Default hypothesis definition for Transducer search algorithms."""
+
+    score: float
+    yseq: List[int]
+    dec_state: Union[
+        Tuple[torch.Tensor, Optional[torch.Tensor]],
+        List[Optional[torch.Tensor]],
+        torch.Tensor,
+    ]
+    lm_state: Union[Dict[str, Any], List[Any]] = None
+
 class JointNetwork(nn.Module):
     def __init__(self, joint_dim, num_outputs):
         super(JointNetwork, self).__init__()
@@ -50,6 +64,8 @@ class JointNetwork(nn.Module):
             enc_out = enc_out.repeat(1, 1, target_lens, 1)
             pred_out = pred_out.repeat(1, seq_lens, 1, 1)
         else:
+            print("a : ", enc_out.size())
+            print("b : ", pred_out.size())
             assert enc_out.dim() == pred_out.dim()
 
         out = torch.cat((enc_out, pred_out), dim=-1)
@@ -302,6 +318,39 @@ class TransformerTransducerModel(BaseFairseqModel):
         decoder_out = self.decoder(prev_output_tokens)
         return encoder_out, decoder_out 
 
+    def greedy_search(self, net_output):
+        """Greedy search implementation.
+        Args:
+            enc_out: Encoder output sequence. (T, D_enc)
+        Returns:
+            hyp: 1-best hypotheses.
+        """
+        encoder_output, _ = net_output
+        enc_outputs = self.encoder_proj(encoder_output["encoder_out"])
+        
+        for enc_out in enc_outputs:
+            dec_state = self.decoder.init_state(1)
+
+            hyp = Hypothesis(score=0.0, yseq=[self.decoder.blank_idx], dec_state=dec_state)
+            cache = {}
+
+            dec_out, state, _ = self.decoder.score(hyp, cache)
+            dec_out = self.decoder_proj(dec_out)
+
+            for t in range(enc_outputs.size(1)):    
+
+                logp = self.joint(enc_out[t], dec_out)
+                top_logp, pred = torch.max(logp, dim=-1)
+
+                if pred != self.decoder.blank_idx:
+                    hyp.yseq.append(int(pred))
+                    hyp.score += float(top_logp)
+                    hyp.dec_state = state
+
+                    dec_out, state, _ = self.decoder.score(hyp, cache)
+                    dec_out = self.decoder_proj(dec_out)
+        return hyp
+
 class LTTRNNEncoder(FairseqEncoder):
     def __init__(self, args, dictionary, embeded_tokens):
         super().__init__(None)
@@ -350,7 +399,7 @@ class LTTRNNEncoder(FairseqEncoder):
 
         return (h_n, None)
 
-    def score(self, dec_input, cache={}):
+    def score(self, hyp, cache={}):
         """One-step forward hypothesis.
         Args:
             hyp: Hypothesis.
@@ -360,6 +409,20 @@ class LTTRNNEncoder(FairseqEncoder):
             new_state: Decoder hidden states. ((N, 1, D_dec), (N, 1, D_dec))
             label: Label ID for LM. (1,)
         """
+        label = torch.full((1, 1), hyp.yseq[-1], dtype=torch.long, device=self.device)
+
+        str_labels = "_".join(list(map(str, hyp.yseq)))
+
+        if str_labels in cache:
+            dec_out, dec_state = cache[str_labels]
+        else:
+            dec_emb = self.embed(label)
+
+            dec_out, dec_state = self._forward(dec_emb, hyp.dec_state)
+            cache[str_labels] = (dec_out, dec_state)
+        
+        return dec_out[0][0], dec_state, label[0]
+
 
 
     def _forward(self, sequence, prev_state):
