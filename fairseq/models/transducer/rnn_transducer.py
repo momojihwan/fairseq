@@ -318,37 +318,34 @@ class TransformerTransducerModel(BaseFairseqModel):
         decoder_out = self.decoder(prev_output_tokens)
         return encoder_out, decoder_out 
 
-    def greedy_search(self, net_output):
+    def greedy_search(self, enc_outputs):
         """Greedy search implementation.
         Args:
-            enc_out: Encoder output sequence. (T, D_enc)
+            enc_outputs: Encoder output sequence. (T, D_enc)
         Returns:
             hyp: 1-best hypotheses.
         """
-        encoder_output, _ = net_output
-        enc_outputs = self.encoder_proj(encoder_output["encoder_out"])
-        
-        for enc_out in enc_outputs:
-            dec_state = self.decoder.init_state(1)
 
-            hyp = Hypothesis(score=0.0, yseq=[self.decoder.blank_idx], dec_state=dec_state)
-            cache = {}
+        dec_state = self.decoder.init_state(1)
 
-            dec_out, state, _ = self.decoder.score(hyp, cache)
-            dec_out = self.decoder_proj(dec_out)
+        hyp = Hypothesis(score=0.0, yseq=[self.decoder.blank_idx], dec_state=dec_state)
+        cache = {}
 
-            for t in range(enc_outputs.size(1)):    
+        dec_out, state, _ = self.decoder.score(hyp, cache)
+        dec_out = self.decoder_proj(dec_out)
 
-                logp = self.joint(enc_out[t], dec_out)
-                top_logp, pred = torch.max(logp, dim=-1)
+        for t in range(enc_outputs.size(0)):    
 
-                if pred != self.decoder.blank_idx:
-                    hyp.yseq.append(int(pred))
-                    hyp.score += float(top_logp)
-                    hyp.dec_state = state
+            logp = self.joint(enc_outputs[t], dec_out)
+            top_logp, pred = torch.max(logp, dim=-1)
 
-                    dec_out, state, _ = self.decoder.score(hyp, cache)
-                    dec_out = self.decoder_proj(dec_out)
+            if pred != self.decoder.blank_idx:
+                hyp.yseq.append(int(pred))
+                hyp.score += float(top_logp)
+                hyp.dec_state = state
+
+                dec_out, state, _ = self.decoder.score(hyp, cache)
+                dec_out = self.decoder_proj(dec_out)
         return hyp
 
 class LTTRNNEncoder(FairseqEncoder):
