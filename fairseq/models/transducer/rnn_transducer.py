@@ -8,6 +8,7 @@ from typing import Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
 from unicodedata import bidirectional
 from fairseq.data.dictionary import Dictionary
+from fairseq.models.transducer.modules import label_smoothing_loss
 
 import torch
 import torch.nn as nn
@@ -21,6 +22,7 @@ from fairseq.models import (
     register_model,
     register_model_architecture,
 )
+from fairseq.models.transducer.modules.label_smoothing_loss import LabelSmoothingLoss
 from fairseq.models.transformer import Embedding 
 from fairseq.modules import (
     FairseqDropout,
@@ -29,7 +31,7 @@ from fairseq.modules import (
     TransformerEncoderLayer,
 )
 from torch import Tensor
-
+from warp_rnnt import rnnt_loss
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +54,7 @@ class JointNetwork(nn.Module):
         self.linear = nn.Linear(joint_dim * 2, num_outputs)
         self.tanh = nn.Tanh()
 
-    def forward(self, enc_out, pred_out):
+    def forward(self, enc_out, pred_out, is_aux: bool=False):
     
         if enc_out.dim() == 3 and pred_out.dim() == 3:  # training
             seq_lens = enc_out.size(1)
@@ -64,15 +66,12 @@ class JointNetwork(nn.Module):
             enc_out = enc_out.repeat(1, 1, target_lens, 1)
             pred_out = pred_out.repeat(1, seq_lens, 1, 1)
         else:
-            print("a : ", enc_out.size())
-            print("b : ", pred_out.size())
             assert enc_out.dim() == pred_out.dim()
 
         out = torch.cat((enc_out, pred_out), dim=-1)
         out = self.tanh(out)
         out = self.linear(out)
-        out = F.log_softmax(out, dim=-1)
-        
+
         return out
 
 class Conv1dSubsampler(nn.Module):
@@ -115,14 +114,32 @@ class Conv1dSubsampler(nn.Module):
 
 @register_model("rnn_transducer")
 class TransformerTransducerModel(BaseFairseqModel):
-    def __init__(self, args, encoder, encoder_proj, decoder, decoder_proj, joint):
+    def __init__(self, args, encoder, encoder_proj, decoder, decoder_proj, joint, ctc_proj, lm_proj, LabelSmoothingLoss, aux_mlp, kl_div):
         super().__init__()
 
+        self.blank_idx = 0
+
+        # transducer
         self.encoder = encoder
         self.decoder = decoder
         self.encoder_proj = encoder_proj
         self.decoder_proj = decoder_proj
         self.joint = joint
+
+        # ctc
+        self.ctc_proj = ctc_proj
+
+        # lm
+        self.lm_proj = lm_proj
+        self.label_smoothing_loss = LabelSmoothingLoss
+
+        # aux
+        self.use_auxiliary = args.use_auxiliary
+        self.aux_mlp = aux_mlp
+
+        # symm_kl_div
+        self.use_symm_kl_div = args.use_symm_kl_div
+        self.kl_div = kl_div
 
     @staticmethod
     def add_args(parser):
@@ -285,13 +302,34 @@ class TransformerTransducerModel(BaseFairseqModel):
         decoder_embed_tokens = build_embedding(
             task.target_dictionary, args.decoder_embed_dim
         )
+
+        # Transducer
         encoder = cls.build_encoder(args)
         decoder = cls.build_decoder(args, task, decoder_embed_tokens)
         encoder_proj = nn.Linear(args.encoder_embed_dim, args.joint_dim)
         decoder_proj = nn.Linear(args.decoder_embed_dim, args.joint_dim)
         joint = JointNetwork(args.joint_dim, len(task.target_dictionary))
 
-        return cls(args, encoder, encoder_proj, decoder, decoder_proj, joint)
+        # CTC
+        ctc_proj = nn.Linear(args.encoder_embed_dim, len(task.target_dictionary))
+
+        # LM
+        lm_proj = nn.Linear(args.decoder_embed_dim, len(task.target_dictionary))
+        smoothing_loss = LabelSmoothingLoss(len(task.target_dictionary), 1, 0.1, normalize_length=False)
+
+        # Auxiliary
+        aux_mlp = nn.Sequential(
+            nn.Linear(args.encoder_embed_dim, args.aux_mlp_dim),
+            nn.LayerNorm(args.aux_mlp_dim),
+            nn.Dropout(p=0),
+            nn.ReLU(),
+            nn.Linear(args.aux_mlp_dim, args.joint_dim)
+        )
+
+        # KL div
+        kl_div = nn.KLDivLoss(reduction="sum")
+
+        return cls(args, encoder, encoder_proj, decoder, decoder_proj, joint, ctc_proj, lm_proj, smoothing_loss, aux_mlp, kl_div)
 
     def get_normalized_probs(
         self,
@@ -309,9 +347,110 @@ class TransformerTransducerModel(BaseFairseqModel):
             encoder_output,
             decoder_output
         )
+        logits = F.log_softmax(logits, dim=-1)
         logits = logits.float()
 
         return logits
+
+    def get_ctc_normalized_probs(
+        self,
+        net_output,
+    ):
+        encoder_output, _ = net_output
+        encoder_output = encoder_output["encoder_out"]
+        
+        ctc_lin = self.ctc_proj(
+            nn.functional.dropout(
+                encoder_output, p=0.1
+            )
+        )
+        ctc_logp = torch.log_softmax(ctc_lin.transpose(0, 1), dim=-1)
+
+        return ctc_logp
+    
+    def get_lm_normalized_probs(
+        self,
+        net_output,
+        targets
+    ):
+        _, decoder_output = net_output
+        
+        lm_lin = self.lm_proj(decoder_output)
+        lm_loss = self.label_smoothing_loss(lm_lin, targets)
+        return lm_loss
+
+    def get_auxiliary_normalized_probs(
+        self,
+        joint_out,
+        net_output,
+        sample
+    ):
+        aux_trans_loss = 0
+        symm_kl_div_loss = 0
+
+        B, T, U, D = joint_out.shape
+
+        target = self.get_targets(sample, net_output)
+        target = target[:, :-1]
+        enc_out, dec_out = net_output
+        dec_out = self.decoder_proj(dec_out)
+        aux_enc_out = enc_out["aux_rnn_out"]
+        aux_t_len = enc_out["aux_rnn_lens"]
+        u_len = sample["target_lengths"] -1
+        num_aux_layers = len(aux_enc_out)
+
+        for p in self.joint.parameters():
+            p.requires_grad = False
+        
+        for i, aux_enc_out_i in enumerate(aux_enc_out):
+            aux_mlp = self.aux_mlp(aux_enc_out_i)
+
+            aux_joint_out = F.log_softmax(self.joint(
+                aux_mlp,
+                dec_out,
+                is_aux=True
+            ), dim=-1)
+            if self.use_auxiliary:
+                aux_trans_loss += (
+                    rnnt_loss(
+                        aux_joint_out,
+                        target.int(),
+                        frames_lengths=aux_t_len[i].int(),
+                        labels_lengths=u_len.int(),
+                        reduction="sum",
+                        blank=self.blank_idx
+                    ) / B
+                )
+                
+            if self.use_symm_kl_div:
+                denom = B * T * U
+
+                kl_main_aux = (
+                    self.kl_div(
+                        F.log_softmax(joint_out, dim=-1),
+                        F.softmax(aux_joint_out, dim=-1)
+                    ) / denom
+                )
+                kl_aux_main = (
+                    self.kl_div(
+                        F.log_softmax(aux_joint_out, dim=-1),
+                        F.softmax(joint_out, dim=-1)
+                    ) / denom
+                )
+
+                symm_kl_div_loss += kl_main_aux + kl_aux_main
+            
+        for p in self.joint.parameters():
+            p.requires_grad = True
+        
+        aux_trans_loss /= num_aux_layers
+
+        if self.use_symm_kl_div:
+            symm_kl_div_loss /= num_aux_layers
+        
+        return aux_trans_loss, symm_kl_div_loss
+
+
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens, prev_output_tokens_length):
         encoder_out = self.encoder(src_tokens, src_lengths)
@@ -539,7 +678,16 @@ class S2TRNNEncoder(FairseqEncoder):
         self.joint_dim = args.joint_dim
         self.rnn_type = args.rnn_type
         self.bidir = args.bidirectional
-        self.linear = nn.Linear(self.embed_dim, self.joint_dim)
+        self.linear = nn.Linear(args.encoder_embed_dim, args.aux_mlp_dim)
+
+        if args.use_auxiliary:
+            self.aux_out_layers = self.valid_aux_enc_out_layers(
+                                    args.aux_trans_loss_enc_out_layers,
+                                    self.elayers-1,
+                                    args.use_symm_kl_div,
+                                    )
+        else:
+            self.aux_out_layers = []
 
         self.padding_idx = 1
 
@@ -560,6 +708,8 @@ class S2TRNNEncoder(FairseqEncoder):
             current_States : RNN hidden states. [N x (B, L, D)]
 
         '''
+        aux_rnn_outputs = []
+        aux_rnn_lens = []
         current_states = []
         
         for layer in range(self.elayers):
@@ -590,17 +740,36 @@ class S2TRNNEncoder(FairseqEncoder):
                     enc_out[:, :, : self.embed_dim] + enc_out[:, :, self.embed_dim :]
                 )
 
+            if layer in self.aux_out_layers:
+                # aux_proj_enc_out = torch.tanh(
+                #     self.linear(enc_out.contiguous().view(-1, enc_out.size(2)))
+                # )
+                # aux_enc_out = aux_proj_enc_out.view(
+                #     enc_out.size(0), enc_out.size(1), -1
+                # )
+                aux_rnn_outputs.append(torch.tanh(enc_out))
+                aux_rnn_lens.append(src_lengths)
+
             if layer < self.elayers - 1:
                 src_tokens = self.dropout(enc_out)
 
         enc_out = torch.tanh(enc_out)
         # enc_out = enc_out.view(enc_out.size(0), enc_out.size(1), -1)
 
-        return {
-            "encoder_out": enc_out,  # (B, L, D)
-            "src_lengths": enc_len,
-            "encoder_states": current_states,  # List[T x B x C]
-        }
+        if aux_rnn_outputs:
+            return {
+                "encoder_out": enc_out,  # (B, L, D)
+                "src_lengths": enc_len,
+                "encoder_states": current_states,  # List[T x B x C]    
+                "aux_rnn_out": aux_rnn_outputs,
+                "aux_rnn_lens": aux_rnn_lens
+            }
+        else:
+            return {
+                "encoder_out": enc_out,  # (B, L, D)
+                "src_lengths": enc_len,
+                "encoder_states": current_states,  # List[T x B x C]
+            }
 
     def forward(
         self,
@@ -660,6 +829,46 @@ class S2TRNNEncoder(FairseqEncoder):
         super().set_num_updates(num_updates)
         self.num_updates = num_updates
 
+
+    def valid_aux_enc_out_layers(
+        self,
+        aux_layer_id: List[int],
+        enc_num_layers: int,
+        use_symm_kl_div_loss: bool,
+    ) -> List[int]:
+        """Check whether provided auxiliary encoder layer IDs are valid.
+        Return the valid list sorted with duplicates removed.
+        Args:
+            aux_layer_id: Auxiliary encoder layer IDs.
+            enc_num_layers: Number of encoder layers.
+            use_symm_kl_div_loss: Whether symmetric KL divergence loss is used.
+            subsample: Subsampling rate per layer.
+        Returns:
+            valid: Valid list of auxiliary encoder layers.
+        """
+        if (
+            not isinstance(aux_layer_id, list)
+            or not aux_layer_id
+            or not all(isinstance(layer, int) for layer in aux_layer_id)
+        ):
+            raise ValueError(
+                "aux-transducer-loss-enc-output-layers option takes a list of layer IDs."
+                " Correct argument format is: '[0, 1]'"
+            )
+
+        sorted_list = sorted(aux_layer_id, key=int, reverse=False)
+        valid = list(filter(lambda x: 0 <= x < enc_num_layers, sorted_list))
+
+        if sorted_list != valid:
+            raise ValueError(
+                "Provided argument for aux-transducer-loss-enc-output-layers is incorrect."
+                " IDs should be between [0, %d]" % enc_num_layers
+            )
+
+
+
+        return valid
+
 def reset_backward_rnn_state(
         states: Union[torch.Tensor, List[Optional[torch.Tensor]]]
     ):
@@ -688,7 +897,7 @@ def base_architecture(args):
     args.bidirectional = getattr(args, "bidirectional", True)
 
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
-    args.decoder_layers = getattr(args, "decoder_layers", 2)
+    args.decoder_layers = getattr(args, "decoder_layers", 1)
     
     args.joint_dim = getattr(args, "joint_dim", 128)
     args.dropout = getattr(args, "dropout", 0.1)
@@ -696,6 +905,14 @@ def base_architecture(args):
     args.activation_fn = getattr(args, "activation_fn", "relu")
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
+
+    # use Auxiliary loss
+    args.use_auxiliary = getattr(args, "use_auxiliary", True)
+    args.aux_trans_loss_enc_out_layers = getattr(args, "aux_transducer_loss_enc_out_layers", [0])
+    args.aux_mlp_dim = getattr(args, "aux_mlp_dim", 128)
+
+    # use Symmetric KL divergence loss
+    args.use_symm_kl_div = getattr(args, "use_symm_kl_div", True)
     
 
 @register_model_architecture("rnn_transducer", "rnn_transducer_s")

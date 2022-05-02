@@ -3,7 +3,9 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+import enum
 import math
+from ntpath import join
 from re import U
 import numpy as np
 from dataclasses import dataclass
@@ -47,18 +49,6 @@ class Sequence(object):
             self.h = seq.h
             self.logp = seq.logp
 
-@dataclass
-class Hypothesis:
-    """Default hypothesis definition for Transducer search algorithms."""
-
-    score: float
-    yseq: List[int]
-    dec_state: Union[
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-        List[Optional[torch.Tensor]],
-        torch.Tensor,
-    ]
-    lm_state: Union[Dict[str, Any], List[Any]] = None
 
 @register_criterion("transducer", dataclass=TransducerCriterionConfig)
 class Transducer(FairseqCriterion):
@@ -68,6 +58,18 @@ class Transducer(FairseqCriterion):
         self.padding_idx = task.tgt_dict.pad() 
         self.bos_idx = task.tgt_dict.bos()
         self.blank_idx = 0
+
+        self.ctc_loss = torch.nn.CTCLoss(
+            blank=self.blank_idx,
+            reduction="none",
+            zero_infinity=True
+        )
+
+        self.trans_loss_weight = 1.0
+        self.ctc_loss_weight = 0.5
+        self.aux_trans_loss_weight = 0.2
+        self.symm_kl_div_loss_weight = 0.2
+        self.lm_loss_weight = 0.5
 
     def forward(self, model, sample, reduce=True):
         """Compute the loss for the given sample.
@@ -81,10 +83,17 @@ class Transducer(FairseqCriterion):
         # sample["target"] = self.get_transducer_tasks_io(sample['target'])
         net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
         
-        loss, _ = self.compute_loss(model, net_output, sample, reduce=reduce)
+        trans_loss, joint_out = self.compute_transducer_loss(model, net_output, sample, reduce=reduce)
+        ctc_loss = self.compute_ctc_loss(model, net_output, sample)
+        lm_loss = self.compute_lm_loss(model, net_output, sample)
+        aux_loss, symm_kl_div_loss = self.compute_aux_transducer_and_symm_kl_div_losses(joint_out, model, net_output, sample)
+
+        loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
+
         # if not self.training:
-        # pred1 = self.greedy_search(model, net_output)
-        # print("pred1 : ", pred1)
+        # pred1 = model.greedy_search(net_output)
+        # print("pred1 : ", pred1.yseq)
+        # exit()
             # pred2 = self.beam_search(net_output[0], 5)
             # print("pred2 : ", pred2)
 
@@ -102,44 +111,6 @@ class Transducer(FairseqCriterion):
         # logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
 
-    # def greedy_search(self, model, net_output):
-    #     """Greedy search implementation.
-    #     Args:
-    #         enc_out: Encoder output sequence. (T, D_enc)
-    #     Returns:
-    #         hyp: 1-best hypotheses.
-    #     """
-    #     encoder_output, _ = net_output
-    #     enc_outputs = model.encoder_proj(encoder_output["encoder_out"][0])
-        
-    #     outputs = list()
-
-    #     for enc_out in enc_outputs:
-    #         pred_tokens = list()
-    #         dec_input = 
-    #         dec_state = model.decoder.init_state.unsqueeze(0)
-    #         dec_out, dec_state = model.decoder._forward(dec_input, dec_state)
-
-    #         # enc : (L, D)
-    #         # dec : (B, L, D)
-    #         for t in range(enc_outputs.size(1)):
-
-    #             logits = model.joint(enc_out[t].view(-1), dec_out.view(-1))
-
-    #             pred_token = logits.argmax(dim=0)
-    #             pred_token = int(pred_token.item())
-    #             if pred_token != 1:
-    #                 pred_tokens.append(pred_token)
-
-    #             dec_input = torch.LongTensor([pred_token])
-
-    #             if torch.cuda.is_available():
-    #                 dec_input = dec_input.cuda()
-    #             dec_out, dec_state = model.decoder._forward(dec_input, dec_state)
-            
-    #         outputs.append(torch.LongTensor(pred_tokens))
-
-    #     return torch.stack(outputs, dim=0)
 
     def beam_search(self, x, T, W):
 
@@ -191,7 +162,7 @@ class Transducer(FairseqCriterion):
 
         return [(B[0].k)[1:]]
 
-    def compute_loss(self, model, net_output, sample, reduce=True):
+    def compute_transducer_loss(self, model, net_output, sample, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
 
         target = model.get_targets(sample, net_output)
@@ -205,12 +176,34 @@ class Transducer(FairseqCriterion):
             target.int(),
             frames_lengths=frames_lengths.int(), 
             labels_lengths=labels_lengths.int(),
-            reduction="mean",
+            reduction="sum",
             blank=self.blank_idx
         )
 
-        return loss, loss
+        return loss, lprobs
     
+    def compute_ctc_loss(self, model, net_output, sample):
+        lprobs = model.get_ctc_normalized_probs(net_output)
+        target = model.get_targets(sample, net_output)
+        frames_lengths = sample["net_input"]["src_lengths"]
+        labels_lengths = sample["target_lengths"]
+
+        with torch.backends.cudnn.flags(deterministic=True):
+            loss_ctc = self.ctc_loss(lprobs, target, frames_lengths.int(), labels_lengths.int())
+        
+        return loss_ctc.mean()
+
+    def compute_aux_transducer_and_symm_kl_div_losses(self, joint_out, model, net_output, sample):
+        aux_trans_loss, symm_kl_div_loss = model.get_auxiliary_normalized_probs(joint_out, net_output, sample)
+
+        return aux_trans_loss, symm_kl_div_loss
+
+    def compute_lm_loss(self, model, net_output, sample):
+        target = model.get_targets(sample, net_output)
+        lm_loss = model.get_lm_normalized_probs(net_output, target)
+
+        return lm_loss
+
     def get_transducer_tasks_io(
         self,
         labels: torch.Tensor,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
@@ -232,6 +225,42 @@ class Transducer(FairseqCriterion):
         target = pad_list(labels_unpad, self.blank_idx).type(torch.int32).to(device)
 
         return target
+
+    @torch.no_grad()
+    def error_calculator(self, model, net_output, target, decoding_type="greedy"):
+        """Calculate sentence-level CER/WER score for hypothesis sequencec.
+
+        Args:
+            net_output: encoder, decoder network output. (enc_out, dec_out)
+            target: Target label ID sequences. (B, L)
+
+        Returns:
+            CER: sentence-lever CER score.
+            WER: sentence-level WER score.
+        
+        """
+        cer, wer = None, None
+        encoder_output, _ = net_output
+        enc_outputs = model.encoder_proj(encoder_output["encoder_out"])
+
+        batch_nbest = list()
+        batch_size = int()
+
+        for b in range(batch_size):
+            if decoding_type == "greedy":
+                nbest_hyps = model.greedy_search(enc_outputs[b])
+            elif decoding_type == "beam":
+                nbest_hyps = model.beam_search(enc_outputs[b])
+            batch_nbest.append(nbest_hyps[-1])
+
+        batch_nbest = [nbest_hyp.yseq[1:] for nbest_hyp in batch_nbest]
+
+        hyps, refs = self.convert_to_char(batch_nbest, target)
+
+        cer = self.calculate_cer(hyps, refs)
+        wer = self.calculate_wer()
+        
+        return cer, wer 
 
 
     @torch.no_grad()
