@@ -79,14 +79,14 @@ class Transducer(FairseqCriterion):
         2) the sample size, which is used as the denominator for the gradient
         3) logging outputs to display while training
         """
-
-        # sample["target"] = self.get_transducer_tasks_io(sample['target'])
-        net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
         
-        trans_loss, joint_out = self.compute_transducer_loss(model, net_output, sample, reduce=reduce)
-        ctc_loss = self.compute_ctc_loss(model, net_output, sample)
-        lm_loss = self.compute_lm_loss(model, net_output, sample)
-        aux_loss, symm_kl_div_loss = self.compute_aux_transducer_and_symm_kl_div_losses(joint_out, model, net_output, sample)
+        net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
+        target, lm_loss_target, t_len, aux_t_len, u_len = self.get_transducer_tasks_io(sample["target"], net_output)
+        
+        trans_loss, joint_out = self.compute_transducer_loss(model, net_output, target, t_len, u_len, reduce=reduce)
+        ctc_loss = self.compute_ctc_loss(model, net_output, target, t_len, u_len)
+        lm_loss = self.compute_lm_loss(model, net_output, lm_loss_target)
+        aux_loss, symm_kl_div_loss = self.compute_aux_transducer_and_symm_kl_div_losses(model, net_output, joint_out, target, aux_t_len, u_len)
 
         loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
 
@@ -162,57 +162,53 @@ class Transducer(FairseqCriterion):
 
         return [(B[0].k)[1:]]
 
-    def compute_transducer_loss(self, model, net_output, sample, reduce=True):
+    def compute_transducer_loss(self, model, net_output, target, t_len, u_len, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
 
-        target = model.get_targets(sample, net_output)
-        target = target [:, :-1]
-        frames_lengths = sample["net_input"]["src_lengths"]
-        labels_lengths = sample["target_lengths"] - 1  # target label length is U - 1
-
         loss = rnnt_loss(
-            lprobs.float(), 
-            # sample["net_input"]["prev_output_tokens"].int(), 
-            target.int(),
-            frames_lengths=frames_lengths.int(), 
-            labels_lengths=labels_lengths.int(),
+            lprobs.float(),
+            target,
+            frames_lengths=t_len, 
+            labels_lengths=u_len,
             reduction="sum",
             blank=self.blank_idx
         )
 
+        loss /= lprobs.size(0)
+
         return loss, lprobs
     
-    def compute_ctc_loss(self, model, net_output, sample):
+    def compute_ctc_loss(self, model, net_output, target, t_len, u_len):
         lprobs = model.get_ctc_normalized_probs(net_output)
-        target = model.get_targets(sample, net_output)
-        frames_lengths = sample["net_input"]["src_lengths"]
-        labels_lengths = sample["target_lengths"]
 
         with torch.backends.cudnn.flags(deterministic=True):
-            loss_ctc = self.ctc_loss(lprobs, target, frames_lengths.int(), labels_lengths.int())
+            loss_ctc = self.ctc_loss(lprobs, target, t_len, u_len)
         
         return loss_ctc.mean()
 
-    def compute_aux_transducer_and_symm_kl_div_losses(self, joint_out, model, net_output, sample):
-        aux_trans_loss, symm_kl_div_loss = model.get_auxiliary_normalized_probs(joint_out, net_output, sample)
+    def compute_aux_transducer_and_symm_kl_div_losses(self, model, net_output, joint_out, target, aux_t_len, u_len):
+        encoder_out, dec_out = net_output
+        aux_enc_out = encoder_out["aux_rnn_out"]
 
+        aux_trans_loss, symm_kl_div_loss = model.get_auxiliary_normalized_probs(aux_enc_out, dec_out, joint_out, target, aux_t_len, u_len)
+        
         return aux_trans_loss, symm_kl_div_loss
 
-    def compute_lm_loss(self, model, net_output, sample):
-        target = model.get_targets(sample, net_output)
-        lm_loss = model.get_lm_normalized_probs(net_output, target)
+    def compute_lm_loss(self, model, net_output, lm_loss_target):
+        lm_loss = model.get_lm_normalized_probs(net_output, lm_loss_target)
 
         return lm_loss
 
     def get_transducer_tasks_io(
         self,
-        labels: torch.Tensor,                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+        labels: torch.Tensor,
+        net_output                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
     ):
         """Get Transducer tasks inputs and outputs
 
         Args:
             labels: Label ID sequences. (B, U)
-            enc_out_len: Time Lengths. (B)
+            net_output: enc_output, dec_output
         
         Returns:
             target: Targer label ID sequences. (B, L)
@@ -220,48 +216,51 @@ class Transducer(FairseqCriterion):
             U_lengths: Label legths. (B)
         """
 
+        encoder_output, decoder_output = net_output
+        enc_out_len = encoder_output["src_lengths"]
+        aux_enc_out_len = encoder_output["aux_rnn_lens"]
+
         device = labels.device
         labels_unpad = [label[label != self.padding_idx] for label in labels]
+        blank = labels[0].new([self.blank_idx])
+
         target = pad_list(labels_unpad, self.blank_idx).type(torch.int32).to(device)
+        lm_loss_target = (
+            pad_list(
+                [torch.cat([y, blank], dim=0) for y in labels_unpad], self.padding_idx
+            )
+            .type(torch.int64)
+            .to(device)
+        )
 
-        return target
-
-    @torch.no_grad()
-    def error_calculator(self, model, net_output, target, decoding_type="greedy"):
-        """Calculate sentence-level CER/WER score for hypothesis sequencec.
-
-        Args:
-            net_output: encoder, decoder network output. (enc_out, dec_out)
-            target: Target label ID sequences. (B, L)
-
-        Returns:
-            CER: sentence-lever CER score.
-            WER: sentence-level WER score.
+        if enc_out_len.dim() > 1:
+            enc_mask_unpad = [m[m != 0] for m in enc_out_len]
+            enc_out_len = list(map(int, [m.size(0) for m in enc_mask_unpad]))
+        else:
+            enc_out_len = list(map(int, enc_out_len))
         
-        """
-        cer, wer = None, None
-        encoder_output, _ = net_output
-        enc_outputs = model.encoder_proj(encoder_output["encoder_out"])
+        t_len = torch.IntTensor(enc_out_len).to(device)
+        u_len = torch.IntTensor([label.size(0) for label in labels_unpad]).to(device)
 
-        batch_nbest = list()
-        batch_size = int()
+        if aux_enc_out_len:
+            aux_t_len = []
 
-        for b in range(batch_size):
-            if decoding_type == "greedy":
-                nbest_hyps = model.greedy_search(enc_outputs[b])
-            elif decoding_type == "beam":
-                nbest_hyps = model.beam_search(enc_outputs[b])
-            batch_nbest.append(nbest_hyps[-1])
+            for i in range(len(aux_enc_out_len)):
+                if aux_enc_out_len[i].dim() > 1:
+                    aux_mask_unpad = [aux[aux != 0] for aux in aux_enc_out_len[i]]
+                    aux_t_len.append(
+                        torch.IntTensor(
+                            list(map(int, [aux.size(0) for aux in aux_mask_unpad]))
+                        ).to(device)
+                    )
+                else:
+                    aux_t_len.append(
+                        torch.IntTensor(list(map(int, aux_enc_out_len[i]))).to(device)
+                    )
+        else:
+            aux_t_len = aux_enc_out_len
 
-        batch_nbest = [nbest_hyp.yseq[1:] for nbest_hyp in batch_nbest]
-
-        hyps, refs = self.convert_to_char(batch_nbest, target)
-
-        cer = self.calculate_cer(hyps, refs)
-        wer = self.calculate_wer()
-        
-        return cer, wer 
-
+        return target, lm_loss_target, t_len, aux_t_len, u_len
 
     @torch.no_grad()
     def compute_accuracy(self, model, net_output, target, sample):

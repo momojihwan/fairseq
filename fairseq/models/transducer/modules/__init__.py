@@ -3,3 +3,6 @@
 
 from .multi_head_attention import *
 from .positionwise_feed_forward import *
+from .mask_conv2d import *
+from .embedding import *
+from .subsampling import *
