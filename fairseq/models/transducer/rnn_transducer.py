@@ -37,23 +37,19 @@ from warp_rnnt import rnnt_loss
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class Hypothesis:
-    """Default hypothesis definition for Transducer search algorithms."""
-
-    score: float
-    yseq: List[int]
-    dec_state: Union[
-        Tuple[torch.Tensor, Optional[torch.Tensor]],
-        List[Optional[torch.Tensor]],
-        torch.Tensor,
-    ]
-    lm_state: Union[Dict[str, Any], List[Any]] = None
 
 class JointNetwork(nn.Module):
-    def __init__(self, joint_dim, num_outputs):
+    def __init__(
+        self,
+        enc_embed_dim,
+        dec_embed_dim,
+        joint_dim,
+        num_outputs,
+    ):
         super(JointNetwork, self).__init__()
-        self.linear = nn.Linear(joint_dim * 2, num_outputs)
+        self.linear_enc = nn.Linear(enc_embed_dim, joint_dim)
+        self.linear_dec = nn.Linear(dec_embed_dim, joint_dim)
+        self.linear_out = nn.Linear(joint_dim, num_outputs)
         self.tanh = nn.Tanh()
 
     def forward(self, enc_out, pred_out, is_aux: bool=False):
@@ -69,10 +65,13 @@ class JointNetwork(nn.Module):
             pred_out = pred_out.repeat(1, seq_lens, 1, 1)
         else:
             assert enc_out.dim() == pred_out.dim()
-
-        out = torch.cat((enc_out, pred_out), dim=-1)
-        out = self.tanh(out)
-        out = self.linear(out)
+        
+        if is_aux:
+            out = self.tanh(enc_out + self.linear_dec(pred_out))
+        else:
+            out = self.tanh(self.linear_enc(enc_out) + self.linear_dec(pred_out))
+        
+        out = self.linear_out(out)
 
         return out
 
@@ -114,8 +113,8 @@ class Conv1dSubsampler(nn.Module):
         return x, self.get_out_seq_lens_tensor(src_lengths)
 
 @register_model("rnn_transducer")
-class TransformerTransducerModel(BaseFairseqModel):
-    def __init__(self, args, encoder, encoder_proj, decoder, decoder_proj, joint, ctc_proj, lm_proj, LabelSmoothingLoss, aux_mlp, kl_div):
+class RNNTransducerModel(BaseFairseqModel):
+    def __init__(self, args, encoder, decoder, joint, ctc_proj, lm_proj, LabelSmoothingLoss, aux_mlp, kl_div):
         super().__init__()
 
         self.blank_idx = 0
@@ -124,10 +123,8 @@ class TransformerTransducerModel(BaseFairseqModel):
         # transducer
         self.encoder = encoder
         self.decoder = decoder
-        self.encoder_proj = encoder_proj
-        self.decoder_proj = decoder_proj
         self.joint = joint
-
+    
         # ctc
         self.ctc_proj = ctc_proj
 
@@ -308,9 +305,7 @@ class TransformerTransducerModel(BaseFairseqModel):
         # Transducer
         encoder = cls.build_encoder(args)
         decoder = cls.build_decoder(args, task, decoder_embed_tokens)
-        encoder_proj = nn.Linear(args.encoder_embed_dim, args.joint_dim)
-        decoder_proj = nn.Linear(args.decoder_embed_dim, args.joint_dim)
-        joint = JointNetwork(args.joint_dim, len(task.target_dictionary))
+        joint = JointNetwork(args.encoder_embed_dim, args.decoder_embed_dim, args.joint_dim, len(task.target_dictionary))
 
         # CTC
         ctc_proj = nn.Linear(args.encoder_embed_dim, len(task.target_dictionary))
@@ -331,7 +326,7 @@ class TransformerTransducerModel(BaseFairseqModel):
         # KL div
         kl_div = nn.KLDivLoss(reduction="sum")
 
-        return cls(args, encoder, encoder_proj, decoder, decoder_proj, joint, ctc_proj, lm_proj, smoothing_loss, aux_mlp, kl_div)
+        return cls(args, encoder, decoder, joint, ctc_proj, lm_proj, smoothing_loss, aux_mlp, kl_div)
 
     def get_normalized_probs(
         self,
@@ -342,8 +337,6 @@ class TransformerTransducerModel(BaseFairseqModel):
         # net_output['encoder_out'] is a (T, B, D) tensor
         encoder_output, decoder_output = net_output
         encoder_output = encoder_output["encoder_out"]
-        encoder_output = self.encoder_proj(encoder_output)
-        decoder_output = self.decoder_proj(decoder_output)
 
         logits = self.joint(
             encoder_output,
@@ -389,7 +382,6 @@ class TransformerTransducerModel(BaseFairseqModel):
         aux_t_len,
         u_len
     ):
-        dec_out = self.decoder_proj(dec_out)
         aux_trans_loss = 0
         symm_kl_div_loss = 0
 
@@ -467,36 +459,6 @@ class TransformerTransducerModel(BaseFairseqModel):
         decoder_out = self.decoder(dec_in)
         return encoder_out, decoder_out 
 
-    def greedy_search(self, enc_outputs):
-        """Greedy search implementation.
-        Args:
-            enc_outputs: Encoder output sequence. (T, D_enc)
-        Returns:
-            hyp: 1-best hypotheses.
-        """
-
-        dec_state = self.decoder.init_state(1)
-
-        hyp = Hypothesis(score=0.0, yseq=[self.decoder.blank_idx], dec_state=dec_state)
-        cache = {}
-
-        dec_out, state, _ = self.decoder.score(hyp, cache)
-        dec_out = self.decoder_proj(dec_out)
-
-        for t in range(enc_outputs.size(0)):    
-
-            logp = self.joint(enc_outputs[t], dec_out)
-            top_logp, pred = torch.max(logp, dim=-1)
-
-            if pred != self.decoder.blank_idx:
-                hyp.yseq.append(int(pred))
-                hyp.score += float(top_logp)
-                hyp.dec_state = state
-
-                dec_out, state, _ = self.decoder.score(hyp, cache)
-                dec_out = self.decoder_proj(dec_out)
-        return hyp
-
 class LTTRNNEncoder(FairseqEncoder):
     def __init__(self, args, dictionary, embeded_tokens):
         super().__init__(None)
@@ -506,7 +468,6 @@ class LTTRNNEncoder(FairseqEncoder):
 
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
-
         self.embed = nn.Embedding(len(dictionary), args.decoder_embed_dim, padding_idx=self.blank_idx)
         self.dropout = nn.Dropout(p=args.dropout)
 
@@ -523,7 +484,7 @@ class LTTRNNEncoder(FairseqEncoder):
         self.dtype = args.rnn_type
         self.dlayers = args.decoder_layers
         self.dunits = args.decoder_embed_dim
-        self.joint_dim = args.joint_dim
+        self.odim = args.joint_dim
 
     def init_state(self, batch_size):
         h_n = torch.zeros(

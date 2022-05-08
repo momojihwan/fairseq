@@ -7,6 +7,7 @@ import enum
 import math
 from ntpath import join
 from re import U
+from fairseq.models.transducer.rnn_transducer import JointNetwork
 import numpy as np
 from dataclasses import dataclass
 from logging import logProcesses
@@ -25,6 +26,7 @@ from fairseq import metrics, utils
 from fairseq.data.data_utils import pad_list
 from fairseq.criterions import FairseqCriterion, register_criterion
 from fairseq.dataclass import FairseqDataclass
+from fairseq.models.transducer.modules.error_calculator import ErrorCalculator
 from omegaconf import II
 
 from warp_rnnt import rnnt_loss
@@ -59,6 +61,8 @@ class Transducer(FairseqCriterion):
         self.bos_idx = task.tgt_dict.bos()
         self.blank_idx = 0
 
+        self.token_list = task.tgt_dict
+
         self.ctc_loss = torch.nn.CTCLoss(
             blank=self.blank_idx,
             reduction="none",
@@ -81,6 +85,9 @@ class Transducer(FairseqCriterion):
         """
         
         net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
+        enc_out, _ = net_output
+        enc_out = enc_out["encoder_out"]
+
         target, lm_loss_target, t_len, aux_t_len, u_len = self.get_transducer_tasks_io(sample["target"], net_output)
         
         trans_loss, joint_out = self.compute_transducer_loss(model, net_output, target, t_len, u_len, reduce=reduce)
@@ -91,8 +98,15 @@ class Transducer(FairseqCriterion):
         loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
 
         # if not self.training:
+        #     self.error_calculator = ErrorCalculator(
+        #         model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "default"
+        #     )
+        #     cer, wer = self.error_calculator(enc_out, target)
+            
         # pred1 = model.greedy_search(net_output)
-        # print("pred1 : ", pred1.yseq)
+        # print("pred1 : ", pred1)
+        # exit()
+                        
         # exit()
             # pred2 = self.beam_search(net_output[0], 5)
             # print("pred2 : ", pred2)
@@ -110,57 +124,6 @@ class Transducer(FairseqCriterion):
         # logging_output["n_correct"] = utils.item(n_correct.data)
         # logging_output["total"] = utils.item(total.data)
         return loss, sample_size, logging_output
-
-
-    def beam_search(self, x, T, W):
-
-        B = [Sequence(blank=0)]
-        batch_size = len(x)
-        enc_out = self.encoder.forward(x)
-        enc_out = enc_out.squeeze() # batch_size 1 일 때 코드
-        for i, f_t in enumerate(enc_out):
-
-            sorted(B, key=lambda a: len(a.k), reverse=True)
-            A = B       # Hypotheses that has emitted null from frame 't' and are now in 't+1'
-            B = []      # Hypotheses that has not yet emitted null from frame 't' and so can continue emitting more symbols from 't'
-
-            pred_state = self.predictor.initial_state.unsqueeze(0)
-
-            while True:
-                y_hat = max(A, key=lambda a: a.logp) # y^ most probable in A
-
-                A.remove(y_hat) # remove y^ from A
-
-                pred_input = torch.tensor([y_hat.k[-1]]).to(x.device)
-
-                g_u, pred_state = self.predictor.forward_one_step(pred_input, y_hat.h)
-
-                h_t_u = self.joint(f_t, g_u[0]) # g_u -> [120(out_dim)] , h_t_u -> [29(vocab)]
-
-                logp = F.log_softmax(h_t_u, dim=0)  # pr(y^) = ~~~~
-
-                for k in range(len(logp)):
-                    yk = Sequence(y_hat)
-
-                    yk.logp += float(logp[k]) # pr(y^+k) = ~~~~
-
-                    if k == 0:
-                        B.append(yk) # add y^ to B
-                        continue
-
-                    yk.h = pred_state; yk.k.append(k);
-
-                    A.append(yk)    # add y^ + k to A
-
-                y_hat = max(A, key=lambda a: a.logp)   # elements most probable in A
-
-                yb = max(B, key=lambda a: a.logp)   # elements most probable in B
-
-                if len(B) >= W and yb.logp >= y_hat.logp: break
-
-            sorted(B, key=lambda a: a.logp, reverse=True)
-
-        return [(B[0].k)[1:]]
 
     def compute_transducer_loss(self, model, net_output, target, t_len, u_len, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
