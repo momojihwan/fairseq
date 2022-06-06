@@ -188,6 +188,7 @@ def main(cfg: FairseqConfig) -> None:
 
         # train for one epoch
         valid_losses, should_stop = train(cfg, trainer, task, epoch_itr)
+        
         if should_stop:
             break
 
@@ -310,6 +311,7 @@ def train(
     num_updates = trainer.get_num_updates()
     logger.info("Start iterating over samples")
     for i, samples in enumerate(progress):
+        
         with metrics.aggregate("train_inner"), torch.autograd.profiler.record_function(
             "train_step-%d" % i
         ):
@@ -341,6 +343,7 @@ def train(
 
     # reset epoch-level meters
     metrics.reset_meters("train")
+    # return _, should_stop
     return valid_losses, should_stop
 
 

@@ -19,24 +19,18 @@ from examples.speech_to_text.data_utils import (
     get_zip_manifest,
     save_df_to_tsv,
 )
-from torchaudio.datasets import LIBRISPEECH
+from fairseq.data.audio.hd100_dataset import HD100h, HD500h
 from tqdm import tqdm
-
 
 log = logging.getLogger(__name__)
 
 SPLITS = [
-    "train-clean-100",
-    # "train-clean-360",
-    # "train-other-500",
-    "dev-clean",
-    "dev-other",
-    "test-clean",
-    "test-other",
+    "train-500",
+    "train-100",
+    "valid",
+    "test",
 ]
-
 MANIFEST_COLUMNS = ["id", "audio", "n_frames", "tgt_text", "speaker"]
-
 
 def process(args):
     out_root = Path(args.output_root).absolute()
@@ -46,37 +40,44 @@ def process(args):
     feature_root.mkdir(exist_ok=True)
     for split in SPLITS:
         print(f"Fetching split {split}...")
-        dataset = LIBRISPEECH(out_root.as_posix(), url=split, download=True)
+        if split == "train-500":
+            dataset = HD500h("/DB/HD_500h", url=split)
+        else:
+            dataset = HD100h(out_root.as_posix(), url=split)
         print("Extracting log mel filter bank features...")
-        for wav, sample_rate, _, spk_id, chapter_no, utt_no in tqdm(dataset):
-            sample_id = f"{spk_id}-{chapter_no}-{utt_no}"
+        for wav, sample_rate, _, spk_id, utt_id in tqdm(dataset):
+            sample_id = f"{spk_id}-{utt_id}"
             extract_fbank_features(
                 wav, sample_rate, feature_root / f"{sample_id}.npy"
-            )
-    # Pack features into ZIP
+                )
+    # # Pack features into ZIP
     zip_path = out_root / "fbank80.zip"
     print("ZIPing features...")
     create_zip(feature_root, zip_path)
     print("Fetching ZIP manifest...")
     audio_paths, audio_lengths = get_zip_manifest(zip_path)
-    # Generate TSV manifest
+    # # Generate TSV manifest
     print("Generating manifest...")
     train_text = []
     for split in SPLITS:
         manifest = {c: [] for c in MANIFEST_COLUMNS}
-        dataset = LIBRISPEECH(out_root.as_posix(), url=split)
-        for _, _, utt, spk_id, chapter_no, utt_no in tqdm(dataset):
-            sample_id = f"{spk_id}-{chapter_no}-{utt_no}"
+        if split == "train-500":
+            dataset = HD500h("/DB/HD_500h", url=split)
+        else:
+            dataset = HD100h(out_root.as_posix(), url=split)
+        for _, _, utt, spk_id, utt_id in tqdm(dataset):
+            sample_id = f"{spk_id}-{utt_id}"
             manifest["id"].append(sample_id)
             manifest["audio"].append(audio_paths[sample_id])
             manifest["n_frames"].append(audio_lengths[sample_id])
-            manifest["tgt_text"].append(utt.lower())
+            manifest["tgt_text"].append(utt)
             manifest["speaker"].append(spk_id)
         save_df_to_tsv(
             pd.DataFrame.from_dict(manifest), out_root / f"{split}.tsv"
         )
         if split.startswith("train"):
             train_text.extend(manifest["tgt_text"])
+    
     # Generate vocab
     vocab_size = "" if args.vocab_type == "char" else str(args.vocab_size)
     spm_filename_prefix = f"spm_{args.vocab_type}{vocab_size}"
@@ -107,7 +108,7 @@ def main():
         default="unigram",
         required=True,
         type=str,
-        choices=["bpe", "unigram", "char", "cjj"],
+        choices=["bpe", "unigram", "char"],
     ),
     parser.add_argument("--vocab-size", default=10000, type=int)
     args = parser.parse_args()

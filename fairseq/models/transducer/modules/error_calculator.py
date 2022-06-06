@@ -49,7 +49,7 @@ class ErrorCalculator(object):
             self.beam_search = BeamSearchTransducer(
                 decoder=decoder,
                 joint_network=joint_network,
-                beam_size=2,
+                beam_size=5,
                 search_type=search_type,
             )
         elif search_type == "greedy":
@@ -118,7 +118,7 @@ class ErrorCalculator(object):
         for b in range(batchsize):
             nbest_hyps = self.beam_search(enc_out[b])
             batch_nbest.append(nbest_hyps[-1])
-
+        
         batch_nbest = [nbest_hyp.yseq[1:] for nbest_hyp in batch_nbest]
         
         hyps, refs = self.convert_to_char(batch_nbest, target.cpu())
@@ -150,12 +150,14 @@ class ErrorCalculator(object):
         for i, hyp in enumerate(hyps):
             hyp_i = [self.token_list[int(h)] for h in hyp]
             ref_i = [self.token_list[int(r)] for r in refs[i]]
+            print("hyp_i : ", hyp_i)
             char_hyp = "".join(hyp_i)
             char_hyp = char_hyp.replace(self.space, " ")
-            char_hyp = char_hyp.replace(self.blank, "")
+            # char_hyp = char_hyp.replace(self.blank, "")
             char_ref = "".join(ref_i).replace(self.space, " ")
             char_ref = char_ref.replace("</s>", "")
             char_ref = char_ref.replace("<s>", "")
+            char_ref = char_ref.replace(self.blank, "")
 
             print("hyp : ", char_hyp)
             print("ref : ", char_ref)

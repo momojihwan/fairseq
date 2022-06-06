@@ -59,8 +59,9 @@ class Transducer(FairseqCriterion):
         self.sentence_avg = sentence_avg
         self.padding_idx = task.tgt_dict.pad() 
         self.bos_idx = task.tgt_dict.bos()
-        self.blank_idx = 0
-
+        self.blank_idx = task.tgt_dict.unk()
+        
+        
         self.token_list = task.tgt_dict
 
         self.ctc_loss = torch.nn.CTCLoss(
@@ -89,18 +90,23 @@ class Transducer(FairseqCriterion):
         enc_out = enc_out["encoder_out"]
 
         target, lm_loss_target, t_len, aux_t_len, u_len = self.get_transducer_tasks_io(sample["target"], net_output)
-        
+        # print("sample target : ", sample["target"].size())
+        # print("target : ", target.size())
+        # exit()
         trans_loss, joint_out = self.compute_transducer_loss(model, net_output, target, t_len, u_len, reduce=reduce)
-        ctc_loss = self.compute_ctc_loss(model, net_output, target, t_len, u_len)
-        lm_loss = self.compute_lm_loss(model, net_output, lm_loss_target)
-        aux_loss, symm_kl_div_loss = self.compute_aux_transducer_and_symm_kl_div_losses(model, net_output, joint_out, target, aux_t_len, u_len)
+        # ctc_loss = self.compute_ctc_loss(model, net_output, target, t_len, u_len)
+        # lm_loss = self.compute_lm_loss(model, net_output, lm_loss_target)
+        # aux_loss, symm_kl_div_loss = self.compute_aux_transducer_and_symm_kl_div_losses(model, net_output, joint_out, target, aux_t_len, u_len)
 
-        loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
-
+        # loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
+        loss = trans_loss
         # if not self.training:
         #     self.error_calculator = ErrorCalculator(
         #         model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "default"
         #     )
+        #     # self.error_calculator = ErrorCalculator(
+        #     #     model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "greedy"
+        #     # )
         #     cer, wer = self.error_calculator(enc_out, target)
             
         # pred1 = model.greedy_search(net_output)
@@ -127,7 +133,6 @@ class Transducer(FairseqCriterion):
 
     def compute_transducer_loss(self, model, net_output, target, t_len, u_len, reduce=True):
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
-
         loss = rnnt_loss(
             lprobs.float(),
             target,

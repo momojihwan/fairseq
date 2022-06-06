@@ -69,7 +69,7 @@ class BeamSearchTransducer:
 
         self.beam_size = beam_size
         self.hidden_size = decoder.dunits
-        self.vocab_size = decoder.odim
+        self.vocab_size = decoder.vocab_size
 
         self.blank_id = decoder.blank_idx
 

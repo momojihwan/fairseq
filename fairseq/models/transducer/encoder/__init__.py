@@ -2,3 +2,4 @@
 # LICENSE file in the root directory of this source tree.
 
 from .transformer_encoder import *
+from .rnn_encoder import *

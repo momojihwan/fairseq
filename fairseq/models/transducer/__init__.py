@@ -3,3 +3,4 @@
 
 from .transformer_transducer import * 
 from .rnn_transducer import * 
+from .rnn_transducer_old import *

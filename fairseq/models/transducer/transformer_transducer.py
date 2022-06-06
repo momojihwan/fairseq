@@ -306,17 +306,9 @@ class LTTTransformerEncoder(FairseqEncoder):
     def __init__(self, args, dictionary, embeded_tokens):
         super().__init__(None)
 
-        self.encoder_freezing_updates = args.encoder_freezing_updates
-        self.num_updates = 0
 
-        self.dropout_module = FairseqDropout(
-            p=args.dropout, module_name=self.__class__.__name__
-        )
-        self.embed_scale = math.sqrt(args.decoder_embed_dim)
-        if args.no_scale_embedding:
-            self.embed_scale = 1.0
-        self.padding_idx = 1
-        self.blank_idx = 0
+        self.padding_idx = dictionary.pad()
+        self.blank_idx = dictionary.unk()
 
         self.embed_tokens = embeded_tokens
 

@@ -724,6 +724,7 @@ class Trainer(object):
         disable_iterator_cache=False,
     ):
         """Return an EpochBatchIterator over given validation subset for a given epoch."""
+        
         batch_iterator = self.task.get_batch_iterator(
             dataset=self.task.dataset(subset),
             max_tokens=self.cfg.dataset.max_tokens_valid,
