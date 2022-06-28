@@ -9,6 +9,7 @@ from pathlib import Path
 from unicodedata import bidirectional
 from fairseq.data.dictionary import Dictionary
 from fairseq.models.transducer.modules import label_smoothing_loss
+from fairseq.models.transducer.modules.time_reduction import TimeReduction
 
 import torch
 import torch.nn as nn
@@ -25,6 +26,9 @@ from fairseq.models import (
 from fairseq.models.transducer.modules.label_smoothing_loss import LabelSmoothingLoss
 from fairseq.models.transducer.modules.net_utils import get_subsample
 from fairseq.models.transducer.modules.subsampling import Conv2dSubsampling
+from fairseq.models.transducer.encoder.rnn_encoder import CustomRNNEncoder
+from fairseq.models.transducer.decoder.rnn_decoder import CustomRNNDecoder
+from fairseq.models.transducer.joint_network import CustomJointNetwork
 from fairseq.models.transformer import Embedding 
 from fairseq.modules import (
     FairseqDropout,
@@ -80,18 +84,17 @@ class RNNTransducerModel(BaseFairseqModel):
     def __init__(self, args, encoder, decoder, joint, ctc_proj, lm_proj, LabelSmoothingLoss, aux_mlp, kl_div):
         super().__init__()
 
-        self.blank_idx = 0
-        self.padding_idx = 1
-
         # transducer
         self.encoder = encoder
         self.decoder = decoder
         self.joint = joint
     
         # ctc
+        self.use_ctc = args.use_ctc
         self.ctc_proj = ctc_proj
 
         # lm
+        self.use_lm = args.use_lm
         self.lm_proj = lm_proj
         self.label_smoothing_loss = LabelSmoothingLoss
 
@@ -100,8 +103,12 @@ class RNNTransducerModel(BaseFairseqModel):
         self.aux_mlp = aux_mlp
 
         # symm_kl_div
-        self.use_symm_kl_div = args.use_symm_kl_div
+        self.use_symm_kl_div = args.use_kl_div
         self.kl_div = kl_div
+
+        self.blank_idx = self.decoder.blank_idx
+        self.padding_idx = self.decoder.padding_idx
+        
 
     @staticmethod
     def add_args(parser):
@@ -271,11 +278,11 @@ class RNNTransducerModel(BaseFairseqModel):
         joint = JointNetwork(args.encoder_embed_dim, args.decoder_embed_dim, args.joint_dim, len(task.target_dictionary))
 
         # CTC
-        ctc_proj = nn.Linear(args.encoder_embed_dim, len(task.target_dictionary))
+        ctc_proj = nn.Linear(args.encoder_embed_dim, len(task.target_dictionary)) if args.use_ctc else None
 
         # LM
-        lm_proj = nn.Linear(args.decoder_embed_dim, len(task.target_dictionary))
-        smoothing_loss = LabelSmoothingLoss(len(task.target_dictionary), 1, 0.1, normalize_length=False)
+        lm_proj = nn.Linear(args.decoder_embed_dim, len(task.target_dictionary)) if args.use_lm else None
+        smoothing_loss = LabelSmoothingLoss(len(task.target_dictionary), 1, 0.1, normalize_length=False) if args.use_lm else None
 
         # Auxiliary
         aux_mlp = nn.Sequential(
@@ -284,10 +291,10 @@ class RNNTransducerModel(BaseFairseqModel):
             nn.Dropout(p=0),
             nn.ReLU(),
             nn.Linear(args.aux_mlp_dim, args.joint_dim)
-        )
+        ) if args.use_auxiliary else None
 
         # KL div
-        kl_div = nn.KLDivLoss(reduction="sum")
+        kl_div = nn.KLDivLoss(reduction="sum") if args.use_kl_div else None
 
         return cls(args, encoder, decoder, joint, ctc_proj, lm_proj, smoothing_loss, aux_mlp, kl_div)
 
@@ -375,7 +382,7 @@ class RNNTransducerModel(BaseFairseqModel):
                     ) / B
                 )
                 
-            if self.use_symm_kl_div:
+            if self.use_kl_div:
                 denom = B * T * U
 
                 kl_main_aux = (
@@ -416,6 +423,7 @@ class RNNTransducerModel(BaseFairseqModel):
         return decoder_input
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens, prev_output_tokens_length):
+
         dec_in = self.get_decoder_input(prev_output_tokens)
 
         encoder_out = self.encoder(src_tokens, src_lengths)
@@ -426,8 +434,8 @@ class LTTRNNEncoder(FairseqEncoder):
     def __init__(self, args, dictionary, embeded_tokens):
         super().__init__(None)
 
-        self.padding_idx = 1
-        self.blank_idx = 0
+        self.padding_idx = dictionary.pad()
+        self.blank_idx = dictionary.bos()
 
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
@@ -593,10 +601,19 @@ class S2TRNNEncoder(FairseqEncoder):
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
 
+        self.time_reduction = TimeReduction(args.time_reduction_stride)
+
+        self.elayers = args.encoder_layers
+        self.embed_dim = args.encoder_embed_dim
+        self.joint_dim = args.joint_dim
+        self.rnn_type = args.rnn_type
+        self.bidir = args.bidirectional
+        
         for i in range(args.encoder_layers):
 
             if i == 0:
-                input_dim = args.input_feat
+                # input_dim = args.input_feat 
+                input_dim = args.input_feat * args.time_reduction_stride
             else:
                 input_dim = args.encoder_embed_dim
             # input_dim = args.encoder_embed_dim
@@ -613,11 +630,6 @@ class S2TRNNEncoder(FairseqEncoder):
 
         self.dropout = nn.Dropout(p=args.dropout)
         
-        self.elayers = args.encoder_layers
-        self.embed_dim = args.encoder_embed_dim
-        self.joint_dim = args.joint_dim
-        self.rnn_type = args.rnn_type
-        self.bidir = args.bidirectional
 
         # self.subsample = get_subsample(args, mode="asr", arch="rnn-t")
         # self.subsample = Conv1dSubsampler(
@@ -633,7 +645,7 @@ class S2TRNNEncoder(FairseqEncoder):
             self.aux_out_layers = self.valid_aux_enc_out_layers(
                                     args.aux_trans_loss_enc_out_layers,
                                     self.elayers-1,
-                                    args.use_symm_kl_div,
+                                    args.use_kl_div,
                                     )
         else:
             self.aux_out_layers = []
@@ -661,18 +673,20 @@ class S2TRNNEncoder(FairseqEncoder):
         # x, input_lengths = self.subsample(src_tokens, src_lengths)
         # x = self.embed_scale * x        
         # x = x.permute(1, 0, 2)
-        x = src_tokens
-        input_lengths = src_lengths
+
+        time_reduction_out, time_reduction_lengths = self.time_reduction(src_tokens, src_lengths)
+        # time_reduction_out = src_tokens
+        # time_reduction_lengths = src_lengths
         aux_rnn_outputs = []
         aux_rnn_lens = []
         current_states = []
         
         for layer in range(self.elayers):
-            if not isinstance(input_lengths, torch.Tensor):
-                input_lengths = torch.tensor(input_lengths)
+            if not isinstance(time_reduction_lengths, torch.Tensor):
+                time_reduction_lengths = torch.tensor(time_reduction_lengths)
             
             pack_enc_input = pack_padded_sequence(
-                x, input_lengths.cpu(), batch_first=True
+                time_reduction_out, time_reduction_lengths.cpu(), batch_first=True
             )
 
             rnn = getattr(self, ("birnn" if self.bidir else "rnn") + str(layer))
@@ -699,7 +713,7 @@ class S2TRNNEncoder(FairseqEncoder):
                 aux_rnn_lens.append(enc_len)
 
             if layer < self.elayers - 1:
-                x = self.dropout(enc_out)
+                time_reduction_out = self.dropout(enc_out)
 
         enc_out = torch.tanh(enc_out)
         # enc_out = enc_out.view(enc_out.size(0), enc_out.size(1), -1)
@@ -707,7 +721,7 @@ class S2TRNNEncoder(FairseqEncoder):
         if aux_rnn_outputs:
             return {
                 "encoder_out": enc_out,  # (B, L, D)
-                "src_lengths": input_lengths,
+                "src_lengths": time_reduction_lengths,
                 "encoder_states": current_states,  # List[T x B x C]    
                 "aux_rnn_out": aux_rnn_outputs,
                 "aux_rnn_lens": aux_rnn_lens
@@ -840,31 +854,37 @@ def base_architecture(args):
     # Convolutional subsampler
     args.conv_kernel_sizes = getattr(args, "conv_kernel_sizes", "5,5")
     args.conv_channels = getattr(args, "conv_channels", 1024)
+    # Time Reduction
+    # args.time_reduction_input_dim = getattr(args, "time_reduction_input_dim", )
+    args.time_reduction_stride = getattr(args, "time_reduction_stride", 4)
     # RNN
     args.rnn_type = getattr(args, "rnn_type", "lstm")
     args.input_feat = getattr(args, "input_feat", 80)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 512)
-    args.encoder_layers = getattr(args, "encoder_layers", 6)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
+    args.encoder_layers = getattr(args, "encoder_layers", 4)
     args.bidirectional = getattr(args, "bidirectional", True)
     
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_layers = getattr(args, "decoder_layers", 1)
     
-    args.joint_dim = getattr(args, "joint_dim", 256)
+    args.joint_dim = getattr(args, "joint_dim", 128)
     args.dropout = getattr(args, "dropout", 0.1)
 
     args.activation_fn = getattr(args, "activation_fn", "relu")
     args.adaptive_softmax_cutoff = getattr(args, "adaptive_softmax_cutoff", None)
     args.adaptive_softmax_dropout = getattr(args, "adaptive_softmax_dropout", 0)
 
-    # use Auxiliary loss
+    # loss condition
     args.use_auxiliary = getattr(args, "use_auxiliary", True)
+    args.use_ctc = getattr(args, "use_ctc", False)
+    args.use_lm = getattr(args, "use_lm", False)
+    args.use_kl_div = getattr(args, "use_kl_div", False)
+
+    # use Auxiliary loss
     args.aux_trans_loss_enc_out_layers = getattr(args, "aux_transducer_loss_enc_out_layers", [0])
     args.aux_mlp_dim = getattr(args, "aux_mlp_dim", 128)
 
     # use Symmetric KL divergence loss
-    args.use_symm_kl_div = getattr(args, "use_symm_kl_div", True)
-
     args.no_scale_embedding = getattr(args, "no_scale_embedding", False)
     
 

@@ -1,5 +1,6 @@
 """Search algorithms for Transducer models."""
 
+from cProfile import label
 import logging
 from typing import List
 from typing import Union
@@ -18,7 +19,6 @@ from fairseq.models.transducer.modules.net_utils import select_lm_state
 from fairseq.models.transducer.modules.net_utils import subtract
 from fairseq.models.transducer.modules.net_utils import ExtendedHypothesis
 from fairseq.models.transducer.modules.net_utils import Hypothesis
-
 
 class BeamSearchTransducer:
     """Beam search implementation for Transducer."""
@@ -75,6 +75,8 @@ class BeamSearchTransducer:
 
         if self.beam_size <= 1:
             self.search_algorithm = self.greedy_search
+        elif search_type == "custom":
+            self.search_algorithm = self.beam_search
         elif search_type == "default":
             self.search_algorithm = self.default_beam_search
         elif search_type == "tsd":
@@ -242,6 +244,57 @@ class BeamSearchTransducer:
                 dec_out, state, _ = self.decoder.score(hyp, cache)
 
         return [hyp]
+    
+    def beam_search(self, enc_out: torch.Tensor) -> List[Hypothesis]:
+
+        beam = min(self.beam_size, self.vocab_size)
+        
+        dec_state = self.decoder.init_state(1)
+
+        B = [Hypothesis(score=0.0, yseq=[self.blank_id], dec_state=dec_state)]
+        cache = {}
+        for enc_out_t in enc_out:
+            sorted(B, key=lambda a: len(a.yseq), reverse=True)
+            A = B
+            B = []
+
+            while True:
+                
+                y_hat = max(A, key=lambda a: a.score)
+                A.remove(y_hat)
+                
+                pred_input = torch.Tensor([y_hat.yseq[-1]])
+
+                g_u, pred_state, _ = self.decoder.score(y_hat, cache)
+
+                h_t_u = self.joint_network(
+                    enc_out_t, g_u
+                )
+
+                logp = torch.log_softmax(h_t_u, dim=0)
+
+                for k in range(len(logp)):
+                    yk = Sequence(y_hat)
+                    yk.logp += float(logp[k])
+
+                    if k == 0:
+                        B.append(yk)
+                        continue
+
+                    yk.dec_state = pred_state; yk.k.append(k);
+
+                    A.append(yk)
+
+                y_hat = max(A, key=lambda a: a.logp)
+
+                yb = max(B, key=lambda a: a.logp)
+
+                if len(B) >= beam and yb.logp >= y_hat.logp: break
+            
+            sorted(B, key=lambda a: a.logp, reverse=True)
+        print("out : ", [(B[0].k)[1:]])
+        exit()
+        return [(B[0].k)[1:]]
 
     def default_beam_search(self, enc_out: torch.Tensor) -> List[Hypothesis]:
         """Beam search implementation.
@@ -255,6 +308,8 @@ class BeamSearchTransducer:
             nbest_hyps: N-best hypothesis.
 
         """
+
+        
         beam = min(self.beam_size, self.vocab_size)
         beam_k = min(beam, (self.vocab_size - 1))
 
@@ -262,11 +317,12 @@ class BeamSearchTransducer:
 
         kept_hyps = [Hypothesis(score=0.0, yseq=[self.blank_id], dec_state=dec_state)]
         cache = {}
-
+        
         for enc_out_t in enc_out:
+            
             hyps = kept_hyps
             kept_hyps = []
-
+            
             while True:
                 max_hyp = max(hyps, key=lambda x: x.score)
                 hyps.remove(max_hyp)
@@ -281,9 +337,9 @@ class BeamSearchTransducer:
                     dim=-1,
                 )
                 top_k = logp[1:].topk(beam_k, dim=-1)
-
-                kept_hyps.append(
-                    Hypothesis(
+                
+                kept_hyps.append(                       # yk :   pr(y^+k) = ~~~~
+                    Hypothesis(                         # add y^ to B
                         score=(max_hyp.score + float(logp[0:1])),
                         yseq=max_hyp.yseq[:],
                         dec_state=max_hyp.dec_state,
@@ -297,12 +353,13 @@ class BeamSearchTransducer:
                     lm_state = max_hyp.lm_state
 
                 for logp, k in zip(*top_k):
+                    
                     score = max_hyp.score + float(logp)
 
                     if self.use_lm:
                         score += self.lm_weight * lm_scores[0][k + 1]
 
-                    hyps.append(
+                    hyps.append(                        # add y^ + k to A
                         Hypothesis(
                             score=score,
                             yseq=max_hyp.yseq[:] + [int(k + 1)],

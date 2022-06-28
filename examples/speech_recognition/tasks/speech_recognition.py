@@ -110,6 +110,8 @@ class SpeechRecognitionTask(LegacyFairseqTask):
         elif args.criterion == "asg_loss":
             for i in range(1, args.max_replabel + 1):
                 tgt_dict.add_symbol(replabel_symbol(i))
+        elif args.criterion == "transducer":
+            tgt_dict.add_symbol("<blank>")
 
         print("| dictionary: {} types".format(len(tgt_dict)))
         return cls(args, tgt_dict)

@@ -281,9 +281,13 @@ def main(args, task=None, model_state=None):
             from examples.speech_recognition.w2l_decoder import W2lFairseqLMDecoder
 
             return W2lFairseqLMDecoder(args, task.target_dictionary)
+        elif w2l_decoder == "beam":
+            from examples.speech_recognition.w2l_decoder import W2lBeamSearch
+        
+            return W2lBeamSearch(args, task.target_dictionary)
         else:
             print(
-                "only flashlight decoders with (viterbi, kenlm, fairseqlm) options are supported at the moment"
+                "only flashlight decoders with (viterbi, kenlm, fairseqlm, beam) options are supported at the moment"
             )
 
     # please do not touch this unless you test both generate.py and infer.py with audio_pretraining task

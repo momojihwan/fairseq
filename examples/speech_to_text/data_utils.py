@@ -22,10 +22,9 @@ import torch
 import soundfile as sf
 from tqdm import tqdm
 
-
-UNK_TOKEN, UNK_TOKEN_ID = "<unk>", 0
-BOS_TOKEN, BOS_TOKEN_ID = "<s>", 2
-EOS_TOKEN, EOS_TOKEN_ID = "</s>", 3
+UNK_TOKEN, UNK_TOKEN_ID = "<unk>", 3
+BOS_TOKEN, BOS_TOKEN_ID = "<s>", 0
+EOS_TOKEN, EOS_TOKEN_ID = "</s>", 2
 PAD_TOKEN, PAD_TOKEN_ID = "<pad>", 1
 
 

@@ -4,3 +4,5 @@
 from .transformer_transducer import * 
 from .rnn_transducer import * 
 from .rnn_transducer_old import *
+from .custom_rnn_transducer import *
+from .joint_network import *

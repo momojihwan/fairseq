@@ -58,9 +58,7 @@ class Transducer(FairseqCriterion):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.padding_idx = task.tgt_dict.pad() 
-        self.bos_idx = task.tgt_dict.bos()
-        self.blank_idx = task.tgt_dict.unk()
-        
+        self.blank_idx = task.tgt_dict.bos()
         
         self.token_list = task.tgt_dict
 
@@ -87,12 +85,10 @@ class Transducer(FairseqCriterion):
         
         net_output = model(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
         enc_out, _ = net_output
-        enc_out = enc_out["encoder_out"]
-
+        # enc_out = enc_out["encoder_out"]
+    
         target, lm_loss_target, t_len, aux_t_len, u_len = self.get_transducer_tasks_io(sample["target"], net_output)
-        # print("sample target : ", sample["target"].size())
-        # print("target : ", target.size())
-        # exit()
+
         trans_loss, joint_out = self.compute_transducer_loss(model, net_output, target, t_len, u_len, reduce=reduce)
         # ctc_loss = self.compute_ctc_loss(model, net_output, target, t_len, u_len)
         # lm_loss = self.compute_lm_loss(model, net_output, lm_loss_target)
@@ -101,14 +97,14 @@ class Transducer(FairseqCriterion):
         # loss = (self.trans_loss_weight * trans_loss) + (self.ctc_loss_weight * ctc_loss) + (self.aux_trans_loss_weight * aux_loss) + (self.symm_kl_div_loss_weight * symm_kl_div_loss) + (self.lm_loss_weight * lm_loss)
         loss = trans_loss
         # if not self.training:
-        #     self.error_calculator = ErrorCalculator(
-        #         model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "default"
-        #     )
-        #     # self.error_calculator = ErrorCalculator(
-        #     #     model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "greedy"
-        #     # )
-        #     cer, wer = self.error_calculator(enc_out, target)
-            
+        # self.error_calculator = ErrorCalculator(
+        #     model.decoder, model.joint, self.token_list, "▁", "<s>", False, True, "default"
+        # )
+        # # self.error_calculator = ErrorCalculator(
+        # #     model.decoder, model.joint, self.token_list, "▁", "<s>", False, True, "greedy"
+        # # )
+        # cer, wer = self.error_calculator(enc_out, target)
+        
         # pred1 = model.greedy_search(net_output)
         # print("pred1 : ", pred1)
         # exit()

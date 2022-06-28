@@ -474,7 +474,7 @@ class LTTRNNEncoder(FairseqEncoder):
     def _forward(self, sequence, prev_state):
         """"
         Args:
-            sequence : (B, L)
+            sequence : (B)
             prev_state : (B, D)
         
         Returns:
@@ -482,8 +482,10 @@ class LTTRNNEncoder(FairseqEncoder):
             (h_next, c_next): Decoder hidden states. (N, B, D), (N, B, D)
 
         """
+        
         embedding = self.embed(sequence)   
         state = self.rnn.forward(embedding, prev_state)
+        
         out = self.linear(state)
         return out, state
 
