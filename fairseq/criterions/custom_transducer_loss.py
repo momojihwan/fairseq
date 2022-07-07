@@ -61,8 +61,10 @@ class Transducer(FairseqCriterion):
         loss, _ = self.compute_transducer_loss(model, net_output, sample["target"], sample["net_input"]["src_lengths"], sample["target_lengths"])
         
         # if not self.training:
-        #     hyp = model.beam_search(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"])
-        #     print("hyp : ", hyp)
+        with torch.no_grad():
+            # hyp = model.beam_search(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"])
+            hyp = model.greedy_search(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"])
+            print("hyp : ", hyp)
             # self.error_calculator = ErrorCalculator(
             #     model.decoder, model.joint, self.token_list, "▁", "<unk>", False, True, "greedy"
             # )

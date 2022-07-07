@@ -3,3 +3,4 @@
 
 from .transformer_decoder import *
 from .rnn_decoder import *
+from .custom_decoder import *

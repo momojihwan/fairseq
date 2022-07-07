@@ -296,6 +296,7 @@ class SpeechToTextDataset(FairseqDataset):
     ) -> Dict:
         if len(samples) == 0:
             return {}
+        
         indices = torch.tensor([x.index for x in samples], dtype=torch.long)
         frames = _collate_frames([x.source for x in samples], self.cfg.use_audio_input)
         # sort samples by descending number of frames
@@ -324,7 +325,7 @@ class SpeechToTextDataset(FairseqDataset):
                 self.tgt_dict.pad(),
                 self.tgt_dict.eos(),
                 left_pad=False,
-                move_eos_to_beginning=True,
+                move_eos_to_beginning=False,
             )
             prev_output_tokens = prev_output_tokens.index_select(0, order)
             ntokens = sum(x.target.size(0) for x in samples)
@@ -336,7 +337,7 @@ class SpeechToTextDataset(FairseqDataset):
                 .index_select(0, order)
                 .view(-1, 1)
             )
-
+        
         net_input = {
             "src_tokens": frames,
             "src_lengths": n_frames,

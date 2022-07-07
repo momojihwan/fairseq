@@ -51,8 +51,8 @@ def collate_tokens(
         size = int(((size - 0.1) // pad_to_multiple + 1) * pad_to_multiple)
 
     batch_size = len(values) if pad_to_bsz is None else max(len(values), pad_to_bsz)
-    res = values[0].new(batch_size, size).fill_(pad_idx)
-
+    res = values[0].new(batch_size, size-1).fill_(pad_idx)
+    
     def copy_tensor(src, dst):
         assert dst.numel() == src.numel()
         if move_eos_to_beginning:
@@ -66,6 +66,7 @@ def collate_tokens(
             dst.copy_(src)
 
     for i, v in enumerate(values):
+        v = v[:-1]
         copy_tensor(v, res[i][size - len(v) :] if left_pad else res[i][: len(v)])
     return res
 

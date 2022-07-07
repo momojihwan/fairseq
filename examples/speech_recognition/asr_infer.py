@@ -20,13 +20,78 @@ import torch
 from fairseq import checkpoint_utils, options, progress_bar, tasks, utils
 from fairseq.data.data_utils import post_process
 from fairseq.logging.meters import StopwatchMeter, TimeMeter
-
+from fairseq.data.data_utils import pad_list
 
 logging.basicConfig()
 logging.root.setLevel(logging.INFO)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+
+def get_transducer_tasks_io(
+        labels: torch.Tensor,
+        net_output                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        
+    ):
+        """Get Transducer tasks inputs and outputs
+
+        Args:
+            labels: Label ID sequences. (B, U)
+            net_output: enc_output, dec_output
+        
+        Returns:
+            target: Targer label ID sequences. (B, L)
+            T_lengths: Time lengths. (B)
+            U_lengths: Label legths. (B)
+        """
+
+        padding_idx = 1
+        blank_idx = 0
+
+        encoder_output, decoder_output = net_output
+        enc_out_len = encoder_output["src_lengths"]
+        aux_enc_out_len = encoder_output["aux_rnn_lens"]
+
+        device = labels.device
+        labels_unpad = [label[label != padding_idx] for label in labels]
+        blank = labels[0].new([blank_idx])
+
+        target = pad_list(labels_unpad, blank_idx).type(torch.int32).to(device)
+        lm_loss_target = (
+            pad_list(
+                [torch.cat([y, blank], dim=0) for y in labels_unpad], padding_idx
+            )
+            .type(torch.int64)
+            .to(device)
+        )
+
+        if enc_out_len.dim() > 1:
+            enc_mask_unpad = [m[m != 0] for m in enc_out_len]
+            enc_out_len = list(map(int, [m.size(0) for m in enc_mask_unpad]))
+        else:
+            enc_out_len = list(map(int, enc_out_len))
+        
+        t_len = torch.IntTensor(enc_out_len).to(device)
+        u_len = torch.IntTensor([label.size(0) for label in labels_unpad]).to(device)
+
+        if aux_enc_out_len:
+            aux_t_len = []
+
+            for i in range(len(aux_enc_out_len)):
+                if aux_enc_out_len[i].dim() > 1:
+                    aux_mask_unpad = [aux[aux != 0] for aux in aux_enc_out_len[i]]
+                    aux_t_len.append(
+                        torch.IntTensor(
+                            list(map(int, [aux.size(0) for aux in aux_mask_unpad]))
+                        ).to(device)
+                    )
+                else:
+                    aux_t_len.append(
+                        torch.IntTensor(list(map(int, aux_enc_out_len[i]))).to(device)
+                    )
+        else:
+            aux_t_len = aux_enc_out_len
+
+        return target, lm_loss_target, t_len, aux_t_len, u_len
 
 def add_asr_eval_argument(parser):
     parser.add_argument("--kspmodel", default=None, help="sentence piece model")
@@ -44,7 +109,7 @@ output units",
     )
     parser.add_argument(
         "--asr-decoder",
-        choices=["greedy", "beam", "tsd", "alsd", "nsc"],
+        choices=["greedy", "default", "tsd", "alsd", "nsc"],
         help="use a asr decoder",
     )
     parser.add_argument(
@@ -237,20 +302,22 @@ def main(args, task=None, model_state=None):
     # Initialize generator
     gen_timer = StopwatchMeter()
 
+    models = models[0]
+
     def build_generator(args):
         asr_decoder = getattr(args, "asr_decoder", None)
         from fairseq.models.transducer.modules.error_calculator import ErrorCalculator
         if asr_decoder == "greedy":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<unk>", False, True, "greedy"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "greedy"
             )
         elif asr_decoder == "default":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<unk>", False, True, "default"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "default"
             )
         elif asr_decoder == "tsd":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<unk>", False, True, "tsd"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "tsd"
             )
         else:
             print(
@@ -260,31 +327,10 @@ def main(args, task=None, model_state=None):
     # please do not touch this unless you test both generate.py and infer.py with audio_pretraining task
     generator = build_generator(args)
 
-    if args.load_emissions:
-        generator = ExistingEmissionsDecoder(
-            generator, np.load(args.load_emissions, allow_pickle=True)
-        )
-        logger.info("loaded emissions from " + args.load_emissions)
-
-    num_sentences = 0
-
     if args.results_path is not None and not os.path.exists(args.results_path):
         os.makedirs(args.results_path)
 
-    max_source_pos = (
-        utils.resolve_max_positions(
-            task.max_positions(), *[model.max_positions() for model in models]
-        ),
-    )
 
-    if max_source_pos is not None:
-        max_source_pos = max_source_pos[0]
-        if max_source_pos is not None:
-            max_source_pos = max_source_pos[0] - 1
-
-    res_files = prepare_result_files(args)
-    errs_t = 0
-    lengths_t = 0
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
         for sample in t:
@@ -294,94 +340,16 @@ def main(args, task=None, model_state=None):
             if "net_input" not in sample:
                 continue
 
-            prefix_tokens = None
-            if args.prefix_size > 0:
-                prefix_tokens = sample["target"][:, : args.prefix_size]
-
-            gen_timer.start()
-            if args.dump_emissions:
-                with torch.no_grad():
-                    encoder_out = models[0](**sample["net_input"])
-                    emm = models[0].get_normalized_probs(encoder_out, log_probs=True)
-                    emm = emm.transpose(0, 1).cpu().numpy()
-                    for i, id in enumerate(sample["id"]):
-                        emissions[id.item()] = emm[i]
-                    continue
-            elif args.dump_features:
-                with torch.no_grad():
-                    encoder_out = models[0](**sample["net_input"])
-                    feat = encoder_out["encoder_out"].transpose(0, 1).cpu().numpy()
-                    for i, id in enumerate(sample["id"]):
-                        padding = (
-                            encoder_out["encoder_padding_mask"][i].cpu().numpy()
-                            if encoder_out["encoder_padding_mask"] is not None
-                            else None
-                        )
-                        features[id.item()] = (feat[i], padding)
-                    continue
-            hypos = task.inference_step(generator, models, sample, prefix_tokens)
-            num_generated_tokens = sum(len(h[0]["tokens"]) for h in hypos)
-            gen_timer.stop(num_generated_tokens)
-
-            for i, sample_id in enumerate(sample["id"].tolist()):
-                speaker = None
-                # id = task.dataset(args.gen_subset).ids[int(sample_id)]
-                id = sample_id
-                toks = (
-                    sample["target"][i, :]
-                    if "target_label" not in sample
-                    else sample["target_label"][i, :]
-                )
-                target_tokens = utils.strip_pad(toks, tgt_dict.pad()).int().cpu()
-                # Process top predictions
-                errs, length = process_predictions(
-                    args,
-                    hypos[i],
-                    None,
-                    tgt_dict,
-                    target_tokens,
-                    res_files,
-                    speaker,
-                    id,
-                )
-                errs_t += errs
-                lengths_t += length
-
-            wps_meter.update(num_generated_tokens)
-            t.log({"wps": round(wps_meter.avg)})
-            num_sentences += (
-                sample["nsentences"] if "nsentences" in sample else sample["id"].numel()
-            )
-
-    wer = None
-    if args.dump_emissions:
-        emm_arr = []
-        for i in range(len(emissions)):
-            emm_arr.append(emissions[i])
-        np.save(args.dump_emissions, emm_arr)
-        logger.info(f"saved {len(emissions)} emissions to {args.dump_emissions}")
-    elif args.dump_features:
-        feat_arr = []
-        for i in range(len(features)):
-            feat_arr.append(features[i])
-        np.save(args.dump_features, feat_arr)
-        logger.info(f"saved {len(features)} emissions to {args.dump_features}")
-    else:
-        if lengths_t > 0:
-            wer = errs_t * 100.0 / lengths_t
-            logger.info(f"WER: {wer}")
-
-        logger.info(
-            "| Processed {} sentences ({} tokens) in {:.1f}s ({:.2f}"
-            "sentences/s, {:.2f} tokens/s)".format(
-                num_sentences,
-                gen_timer.n,
-                gen_timer.sum,
-                num_sentences / gen_timer.sum,
-                1.0 / gen_timer.avg,
-            )
-        )
-        logger.info("| Generate {} with beam={}".format(args.gen_subset, args.beam))
+            with torch.no_grad():
+                net_output = models(sample["net_input"]["src_tokens"], sample["net_input"]["src_lengths"], sample["net_input"]["prev_output_tokens"], sample["target_lengths"])
+                target, lm_loss_target, t_len, aux_t_len, u_len = get_transducer_tasks_io(sample["target"], net_output)
+                emm = models.get_normalized_probs(net_output, log_probs=True)
+                enc_out, _ = net_output
+                enc_out = enc_out["encoder_out"]
+            
+            cer, wer = generator(enc_out, target)
+    logger.info(f"WER: {wer}")
+    logger.info("| Generate {} with beam={}".format(args.gen_subset, args.beam))
     return task, wer
 
 

@@ -236,3 +236,18 @@ def create_lm_batch_states(
     ]
 
     return new_states
+
+def get_activation(act):
+    """Return activation function."""
+    # Lazy load to avoid unused import
+    from espnet.nets.pytorch_backend.conformer.swish import Swish
+
+    activation_funcs = {
+        "hardtanh": torch.nn.Hardtanh,
+        "tanh": torch.nn.Tanh,
+        "relu": torch.nn.ReLU,
+        "selu": torch.nn.SELU,
+        "swish": Swish,
+    }
+
+    return activation_funcs[act]()

@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from email.encoders import encode_7or8bit
 import logging
 import math
+import sre_compile
 from typing import Dict, List, Optional, Tuple, Union, Any
 from pathlib import Path
 from unicodedata import bidirectional
@@ -128,53 +129,90 @@ class CustomRNNTransducerModel(BaseFairseqModel):
         decoder_out = self.decoder(prev_output_tokens, prev_output_tokens_length)
         return encoder_out, decoder_out 
     
-    def beam_search(self, src_tokens, src_lengths, beam_size=5):
+    def greedy_search(self, src_tokens, src_lengths):
+        y_batch = []
+        B = len(src_tokens)
+        enc_out = self.encoder.forward(src_tokens, src_lengths)
+        U_max = 300
+        
+        for b in range(B):
+            t = 0; u = 0;
+            y = [self.decoder.start_symbol]
+
+            pred_state = self.decoder.initial_state.unsqueeze(0)
+            
+            while t < src_lengths[b] and u < U_max:
+
+                pred_input = torch.tensor([y[-1]]).to(src_tokens.device)
+                g_u, pred_state = self.decoder.forward_one_step(pred_input, pred_state)
+                f_t = enc_out[b, t]
+                h_t_u = self.joint.forward(f_t, g_u)
+                
+                argmax = h_t_u.max(-1)[1].item()
+                
+                if argmax == 0:
+                    t += 1
+                else:    # argmax is a label
+                    u += 1
+                    y.append(argmax)
+                 
+            y_batch.append(y[1:])    # except start symbol
+        
+        return y_batch
+
+    def beam_search(self, src_tokens, src_lengths, beam_size=2):
         B = [Sequence(blank=0)]
         batch_size = len(src_tokens)
         enc_out = self.encoder.forward(src_tokens, src_lengths)
-        enc_out = enc_out.squeeze() # batch_size 1 일 때 코드 
-        for i, f_t in enumerate(enc_out):
-    
-            sorted(B, key=lambda a: len(a.k), reverse=True)
-            A = B       # Hypotheses that has emitted null from frame 't' and are now in 't+1'
-            B = []      # Hypotheses that has not yet emitted null from frame 't' and so can continue emitting more symbols from 't'
-            
-            pred_state = self.decoder.initial_state.unsqueeze(0)
-            
-            while True:
-                y_hat = max(A, key=lambda a: a.logp) # y^ most probable in A
-                
-                A.remove(y_hat) # remove y^ from A
-                
-                pred_input = torch.tensor([y_hat.k[-1]]).to(src_tokens.device)
+        # enc_out = enc_out.squeeze() # batch_size 1 일 때 코드 
 
-                g_u, pred_state = self.decoder.forward_one_step(pred_input, y_hat.h)
-
-                h_t_u = self.joint(f_t, g_u[0]) # g_u -> [120(out_dim)] , h_t_u -> [29(vocab)]
-    
-                logp = F.log_softmax(h_t_u, dim=0)  # pr(y^) = ~~~~
-                
-                for k in range(len(logp)):
-                    yk = Sequence(y_hat)
-                    
-                    yk.logp += float(logp[k]) # pr(y^+k) = ~~~~
-                    
-                    if k == 0:
-                        B.append(yk) # add y^ to B     
-                        continue
-                    
-                    yk.h = pred_state; yk.k.append(k);
-
-                    A.append(yk)    # add y^ + k to A
-                
-                y_hat = max(A, key=lambda a: a.logp)   # elements most probable in A
-                
-                yb = max(B, key=lambda a: a.logp)   # elements most probable in B
-                
-                if len(B) >= beam_size and yb.logp >= y_hat.logp: break
-
-            sorted(B, key=lambda a: a.logp, reverse=True)
+        for b in range(batch_size):
+            print("b : ", b)
+            for i, f_t in enumerate(enc_out[b]):
         
+                sorted(B, key=lambda a: len(a.k), reverse=True)
+                A = B       # Hypotheses that has emitted null from frame 't' and are now in 't+1'
+                B = []      # Hypotheses that has not yet emitted null from frame 't' and so can continue emitting more symbols from 't'
+
+                pred_state = self.decoder.initial_state.unsqueeze(0)
+                
+                while True:
+                    y_hat = max(A, key=lambda a: a.logp) # y^ most probable in A
+                    
+                    A.remove(y_hat) # remove y^ from A
+                    
+                    pred_input = torch.tensor([y_hat.k[-1]]).to(src_tokens.device)
+
+                    g_u, pred_state = self.decoder.forward_one_step(pred_input, y_hat.h)
+
+                    h_t_u = self.joint(f_t, g_u[0]) # g_u -> [120(out_dim)] , h_t_u -> [29(vocab)]
+        
+                    logp = F.log_softmax(h_t_u, dim=0)  # pr(y^) = ~~~~
+
+                    for k in range(len(logp)):
+                        yk = Sequence(y_hat)
+                        
+                        yk.logp += float(logp[k]) # pr(y^+k) = ~~~~
+                        
+                        if k == 0:
+                            B.append(yk) # add y^ to B     
+                            continue
+                        
+                        yk.h = pred_state; yk.k.append(k);
+
+                        A.append(yk)    # add y^ + k to A
+                    
+                    y_hat = max(A, key=lambda a: a.logp)   # elements most probable in A
+                    
+                    yb = max(B, key=lambda a: a.logp)   # elements most probable in B
+                    
+                    if len(B) >= beam_size and yb.logp >= y_hat.logp: break
+
+                sorted(B, key=lambda a: a.logp, reverse=True)
+        
+            print("B : ", [(B[0].k)[1:]])
+            exit()
+            
         return [(B[0].k)[1:]]
 
 @register_model_architecture(model_name="custom_rnn_transducer", arch_name="custom_rnn_transducer")

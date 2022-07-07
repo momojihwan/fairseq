@@ -58,7 +58,7 @@ class Transducer(FairseqCriterion):
         super().__init__(task)
         self.sentence_avg = sentence_avg
         self.padding_idx = task.tgt_dict.pad() 
-        self.blank_idx = task.tgt_dict.bos()
+        self.blank_idx = task.tgt_dict.index("<blank>")
         
         self.token_list = task.tgt_dict
 
@@ -128,6 +128,21 @@ class Transducer(FairseqCriterion):
         return loss, sample_size, logging_output
 
     def compute_transducer_loss(self, model, net_output, target, t_len, u_len, reduce=True):
+        encoder_output, decoder_output = net_output
+        encoder_output = encoder_output["encoder_out"]
+
+        # joint_out = model.joint(encoder_output, decoder_output)
+        # loss = rnnt_loss(
+        #     joint_out,
+        #     target,
+        #     frames_lengths=t_len, 
+        #     labels_lengths=u_len,
+        #     reduction="sum",
+        #     blank=self.blank_idx
+        # )
+        # loss /= joint_out.size(0)
+
+        # return loss, joint_out
         lprobs = model.get_normalized_probs(net_output, log_probs=True)
         loss = rnnt_loss(
             lprobs.float(),

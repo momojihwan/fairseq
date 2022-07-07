@@ -25,20 +25,23 @@ class Dictionary:
         pad="<pad>",
         eos="</s>",
         unk="<unk>",
-        extra_special_symbols=None,
+        extra_special_symbols=["<blank>"],
     ):
         self.bos_word, self.unk_word, self.pad_word, self.eos_word = bos, unk, pad, eos
         self.symbols = []
         self.count = []
         self.indices = {}
+        
+        if extra_special_symbols:
+            for s in extra_special_symbols:
+                self.add_symbol(s)
+                
         self.bos_index = self.add_symbol(bos)
         self.pad_index = self.add_symbol(pad)
         self.eos_index = self.add_symbol(eos)
         self.unk_index = self.add_symbol(unk)
 
-        if extra_special_symbols:
-            for s in extra_special_symbols:
-                self.add_symbol(s)
+        
         self.nspecial = len(self.symbols)
 
     def __eq__(self, other):

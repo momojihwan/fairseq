@@ -49,7 +49,7 @@ class ErrorCalculator(object):
             self.beam_search = BeamSearchTransducer(
                 decoder=decoder,
                 joint_network=joint_network,
-                beam_size=5,
+                beam_size=2,
                 search_type=search_type,
             )
         elif search_type == "custom":
@@ -122,7 +122,6 @@ class ErrorCalculator(object):
         # enc_out = enc_out.to(next(self.decoder.parameters()).device)
         
         for b in range(batchsize):
-            print("b : ", b)
             nbest_hyps = self.beam_search(enc_out[b])
             batch_nbest.append(nbest_hyps[-1])
         
@@ -159,7 +158,7 @@ class ErrorCalculator(object):
             ref_i = [self.token_list[int(r)] for r in refs[i]]
             # print("hyp_i : ", hyp_i)
             # print("ref_i : ", ref_i)
-            
+            # exit()
             char_hyp = "".join(hyp_i)
             char_hyp = char_hyp.replace(self.space, " ")
             char_hyp = char_hyp.replace("</s>", "")

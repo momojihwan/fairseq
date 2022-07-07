@@ -56,7 +56,7 @@ class JointNetwork(nn.Module):
         self.linear_out = nn.Linear(joint_dim, num_outputs)
         self.tanh = nn.Tanh()
 
-    def forward(self, enc_out, pred_out, is_aux: bool=False):
+    def forward(self, enc_out, pred_out, is_aux: bool=False, quantization: bool=False):
     
         if enc_out.dim() == 3 and pred_out.dim() == 3:  # training
             seq_lens = enc_out.size(1)
@@ -72,6 +72,9 @@ class JointNetwork(nn.Module):
         
         if is_aux:
             out = self.tanh(enc_out + self.linear_dec(pred_out))
+        elif quantization:
+            out = self.tanh(self.linear_enc(enc_out.unsqueeze(0)) + self.linear_dec(pred_out.unsqueeze(0)))
+            return self.linear_out(out)[0]
         else:
             out = self.tanh(self.linear_enc(enc_out) + self.linear_dec(pred_out))
         
@@ -423,11 +426,11 @@ class RNNTransducerModel(BaseFairseqModel):
         return decoder_input
 
     def forward(self, src_tokens, src_lengths, prev_output_tokens, prev_output_tokens_length):
-
         dec_in = self.get_decoder_input(prev_output_tokens)
-
+        
         encoder_out = self.encoder(src_tokens, src_lengths)
         decoder_out = self.decoder(dec_in)
+
         return encoder_out, decoder_out 
 
 class LTTRNNEncoder(FairseqEncoder):
@@ -435,8 +438,8 @@ class LTTRNNEncoder(FairseqEncoder):
         super().__init__(None)
 
         self.padding_idx = dictionary.pad()
-        self.blank_idx = dictionary.bos()
-
+        self.blank_idx = dictionary.index("<blank>")
+        
         self.encoder_freezing_updates = args.encoder_freezing_updates
         self.num_updates = 0
         self.embed = nn.Embedding(len(dictionary), args.decoder_embed_dim, padding_idx=self.blank_idx)
@@ -612,8 +615,8 @@ class S2TRNNEncoder(FairseqEncoder):
         for i in range(args.encoder_layers):
 
             if i == 0:
-                # input_dim = args.input_feat 
-                input_dim = args.input_feat * args.time_reduction_stride
+                input_dim = args.input_feat 
+                # input_dim = args.input_feat * args.time_reduction_stride
             else:
                 input_dim = args.encoder_embed_dim
             # input_dim = args.encoder_embed_dim
@@ -650,7 +653,7 @@ class S2TRNNEncoder(FairseqEncoder):
         else:
             self.aux_out_layers = []
 
-        self.padding_idx = 1
+        self.padding_idx = 2
 
     def _forward(
         self, 
@@ -674,9 +677,9 @@ class S2TRNNEncoder(FairseqEncoder):
         # x = self.embed_scale * x        
         # x = x.permute(1, 0, 2)
 
-        time_reduction_out, time_reduction_lengths = self.time_reduction(src_tokens, src_lengths)
-        # time_reduction_out = src_tokens
-        # time_reduction_lengths = src_lengths
+        # time_reduction_out, time_reduction_lengths = self.time_reduction(src_tokens, src_lengths)
+        time_reduction_out = src_tokens
+        time_reduction_lengths = src_lengths
         aux_rnn_outputs = []
         aux_rnn_lens = []
         current_states = []
@@ -867,7 +870,7 @@ def base_architecture(args):
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_layers = getattr(args, "decoder_layers", 1)
     
-    args.joint_dim = getattr(args, "joint_dim", 128)
+    args.joint_dim = getattr(args, "joint_dim", 300)
     args.dropout = getattr(args, "dropout", 0.1)
 
     args.activation_fn = getattr(args, "activation_fn", "relu")
