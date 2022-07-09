@@ -161,10 +161,10 @@ class ErrorCalculator(object):
             # exit()
             char_hyp = "".join(hyp_i)
             char_hyp = char_hyp.replace(self.space, " ")
-            char_hyp = char_hyp.replace("</s>", "")
+            char_hyp = char_hyp.replace("<pad>", "")
             char_ref = "".join(ref_i).replace(self.space, " ")
             char_ref = char_ref.replace(self.blank, "")
-            char_ref = char_ref.replace("</s>", "")
+            char_ref = char_ref.replace("<pad>", "")
             
             print("hyp : ", char_hyp)
             print("ref : ", char_ref)

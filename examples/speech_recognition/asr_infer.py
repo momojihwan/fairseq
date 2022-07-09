@@ -309,15 +309,15 @@ def main(args, task=None, model_state=None):
         from fairseq.models.transducer.modules.error_calculator import ErrorCalculator
         if asr_decoder == "greedy":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "greedy"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<blank>", False, True, "greedy"
             )
         elif asr_decoder == "default":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "default"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<blank>", False, True, "default"
             )
         elif asr_decoder == "tsd":
             return ErrorCalculator(
-                models.decoder, models.joint, task.tgt_dict, "▁", "<s>", False, True, "tsd"
+                models.decoder, models.joint, task.tgt_dict, "▁", "<blank>", False, True, "tsd"
             )
         else:
             print(
