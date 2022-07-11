@@ -330,6 +330,7 @@ def main(args, task=None, model_state=None):
     if args.results_path is not None and not os.path.exists(args.results_path):
         os.makedirs(args.results_path)
 
+    wer_list = []
 
     with progress_bar.build_progress_bar(args, itr) as t:
         wps_meter = TimeMeter()
@@ -348,9 +349,15 @@ def main(args, task=None, model_state=None):
                 enc_out = enc_out["encoder_out"]
             
             cer, wer = generator(enc_out, target)
-    logger.info(f"WER: {wer}")
+            wer_list.append(wer)
+
+    
+    WER = sum(wer_list, 0.0) / len(wer_list)
+
+    print(f"WER : {WER}\n")
+    logger.info(f"WER: {WER}")
     logger.info("| Generate {} with beam={}".format(args.gen_subset, args.beam))
-    return task, wer
+    return task, WER
 
 
 def make_parser():

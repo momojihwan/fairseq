@@ -6,6 +6,8 @@ from typing import List
 from typing import Tuple
 from typing import Union
 
+import numpy as np
+
 import torch
 
 from fairseq.models.transducer.beam_search_transducer import BeamSearchTransducer
@@ -49,7 +51,7 @@ class ErrorCalculator(object):
             self.beam_search = BeamSearchTransducer(
                 decoder=decoder,
                 joint_network=joint_network,
-                beam_size=2,
+                beam_size=5,
                 search_type=search_type,
             )
         elif search_type == "custom":
@@ -168,6 +170,7 @@ class ErrorCalculator(object):
             
             print("hyp : ", char_hyp)
             print("ref : ", char_ref)
+            print("---------------------------------")
             # exit()
             char_hyps.append(char_hyp)
             char_refs.append(char_ref)
@@ -197,7 +200,7 @@ class ErrorCalculator(object):
             distances.append(editdistance.eval(char_hyp, char_ref))
             lens.append(len(char_ref))
 
-        return float(sum(distances)) / sum(lens)
+        return float(sum(distances)) / sum(lens) * 100
 
     def calculate_wer(self, hyps: torch.Tensor, refs: torch.Tensor) -> float:
         """Calculate sentence-level WER score.
@@ -221,4 +224,5 @@ class ErrorCalculator(object):
             distances.append(editdistance.eval(word_hyp, word_ref))
             lens.append(len(word_ref))
 
-        return float(sum(distances)) / sum(lens)
+        return float(sum(distances)) / sum(lens) * 100
+    
