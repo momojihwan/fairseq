@@ -223,7 +223,7 @@ def base_architecture(args):
     args.conv_channels = getattr(args, "conv_channels", 1024)
     # Time Reduction
     # args.time_reduction_input_dim = getattr(args, "time_reduction_input_dim", )
-    args.use_time_reduction = getattr(args, "use_time_reduction", False)
+    args.use_time_reduction = getattr(args, "use_time_reduction", True)
     args.time_reduction_stride = getattr(args, "time_reduction_stride", 4)
     # RNN
     args.rnn_type = getattr(args, "rnn_type", "lstm")

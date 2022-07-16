@@ -7,7 +7,7 @@ import enum
 import math
 from ntpath import join
 from re import U
-from fairseq.models.transducer.rnn_transducer import JointNetwork
+
 import numpy as np
 from dataclasses import dataclass
 from logging import logProcesses

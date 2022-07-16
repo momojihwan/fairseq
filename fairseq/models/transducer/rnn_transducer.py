@@ -615,8 +615,8 @@ class S2TRNNEncoder(FairseqEncoder):
         for i in range(args.encoder_layers):
 
             if i == 0:
-                input_dim = args.input_feat 
-                # input_dim = args.input_feat * args.time_reduction_stride
+                # input_dim = args.input_feat 
+                input_dim = args.input_feat * args.time_reduction_stride
             else:
                 input_dim = args.encoder_embed_dim
             # input_dim = args.encoder_embed_dim
@@ -672,14 +672,10 @@ class S2TRNNEncoder(FairseqEncoder):
             current_States : RNN hidden states. [N x (B, L, D)]
 
         '''
-        
-        # x, input_lengths = self.subsample(src_tokens, src_lengths)
-        # x = self.embed_scale * x        
-        # x = x.permute(1, 0, 2)
 
-        # time_reduction_out, time_reduction_lengths = self.time_reduction(src_tokens, src_lengths)
-        time_reduction_out = src_tokens
-        time_reduction_lengths = src_lengths
+        time_reduction_out, time_reduction_lengths = self.time_reduction(src_tokens, src_lengths)
+        # time_reduction_out = src_tokens
+        # time_reduction_lengths = src_lengths
         aux_rnn_outputs = []
         aux_rnn_lens = []
         current_states = []
@@ -719,7 +715,6 @@ class S2TRNNEncoder(FairseqEncoder):
                 time_reduction_out = self.dropout(enc_out)
 
         enc_out = torch.tanh(enc_out)
-        # enc_out = enc_out.view(enc_out.size(0), enc_out.size(1), -1)
 
         if aux_rnn_outputs:
             return {
@@ -863,9 +858,9 @@ def base_architecture(args):
     # RNN
     args.rnn_type = getattr(args, "rnn_type", "lstm")
     args.input_feat = getattr(args, "input_feat", 80)
-    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 256)
-    args.encoder_layers = getattr(args, "encoder_layers", 4)
-    args.bidirectional = getattr(args, "bidirectional", True)
+    args.encoder_embed_dim = getattr(args, "encoder_embed_dim", 1024)
+    args.encoder_layers = getattr(args, "encoder_layers", 6)
+    args.bidirectional = getattr(args, "bidirectional", False)
     
     args.decoder_embed_dim = getattr(args, "decoder_embed_dim", args.encoder_embed_dim)
     args.decoder_layers = getattr(args, "decoder_layers", 1)

@@ -32,6 +32,7 @@ from omegaconf import II
 from warp_rnnt import rnnt_loss
 
 
+
 @dataclass
 class TransducerCriterionConfig(FairseqDataclass):
     sentence_avg: bool = II("optimization.sentence_avg")
